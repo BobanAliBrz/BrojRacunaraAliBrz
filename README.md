@@ -20,7 +20,7 @@ A minimal Windows utility that displays **"Broj Racunara: [IP]"** directly in th
 
 ## Requirements
 
-- Windows 10 or 11
+- Windows 7, 10, or 11
 - That's it. No .NET, no VC++ redist, nothing.
 
 ## Usage
