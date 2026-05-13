@@ -1,0 +1,15 @@
+[package]
+name = "taskbar-ip"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winapi = { version = "0.3", features = ["winuser", "wingdi", "libloaderapi", "winreg", "iphlpapi", "consoleapi", "ws2def", "tlhelp32", "handleapi", "processthreadsapi", "fileapi", "errhandlingapi", "winnt", "ntdef"] }
+
+[[bin]]
+name = "taskbar-ip"
+path = "src/main.rs"
+
+[[bin]]
+name = "uninstall"
+path = "src/uninstall.rs"
