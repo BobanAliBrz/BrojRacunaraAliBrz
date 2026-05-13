@@ -5,7 +5,8 @@
 
 A minimal Windows utility that displays **"Broj Racunara: [IP]"** directly in the Windows 11 taskbar, left of the system notification tray (clock area). Shows your current IPv4 address at a glance — no clicking, no menus, no GUI.
 
-[taskbar-ip.exe]: Screenshot placeholder
+<img width="569" height="47" alt="Screenshot 2026-05-13 140148" src="https://github.com/user-attachments/assets/bb8e8ca5-5558-4828-bbe7-af340dcfaaeb" />
+
 
 ## Features
 
