@@ -3,7 +3,7 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
-use winapi::shared::minwindef::{HKEY, LPBYTE, DWORD};
+use winapi::shared::minwindef::{HKEY, DWORD};
 use winapi::shared::ntdef::HANDLE;
 use winapi::um::winreg::*;
 use winapi::um::handleapi::CloseHandle;
@@ -16,35 +16,6 @@ const INVALID_HANDLE_VALUE: HANDLE = !0 as HANDLE;
 
 fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
-}
-
-fn get_exe_path_from_registry() -> Option<String> {
-    unsafe {
-        let mut hkey: HKEY = ptr::null_mut();
-        let path = to_wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-        let ret = RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, 0x00020000, &mut hkey);
-        if ret != 0 { return None; }
-
-        let name = to_wide("TaskbarIP");
-        let mut buf = [0u16; 520];
-        let mut size: DWORD = (buf.len() * 2) as DWORD;
-        let query_ret = RegQueryValueExW(
-            hkey,
-            name.as_ptr(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            buf.as_mut_ptr() as LPBYTE,
-            &mut size,
-        );
-        RegCloseKey(hkey);
-
-        if query_ret == 0 && size > 0 {
-            let len = (size / 2) as usize - 1;
-            Some(String::from_utf16_lossy(&buf[..len]))
-        } else {
-            None
-        }
-    }
 }
 
 fn kill_processes_by_name(name: &str) {
@@ -74,19 +45,27 @@ fn kill_processes_by_name(name: &str) {
     }
 }
 
+fn delete_file_wide(path: &str) {
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe { DeleteFileW(wide.as_ptr()); }
+}
+
 fn main() {
     // 1. Kill any running taskbar-ip.exe
     kill_processes_by_name("taskbar-ip.exe");
 
-    // 2. Read the exe path from registry
-    let exe_path = get_exe_path_from_registry();
+    // Give processes a moment to terminate
+    unsafe {
+        winapi::um::synchapi::Sleep(500);
+    }
 
-    // 3. Remove registry key from both HKLM (all users) and HKCU (current user)
+    // 2. Remove registry keys from both HKLM (all users) and HKCU (current user)
     unsafe {
         for &hive in &[HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
             let mut hkey: HKEY = ptr::null_mut();
             let path = to_wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-            if RegOpenKeyExW(hive, path.as_ptr(), 0, 0x00020000, &mut hkey) == 0 {
+            // KEY_SET_VALUE = 0x0002 — need write access to delete values
+            if RegOpenKeyExW(hive, path.as_ptr(), 0, 0x0002, &mut hkey) == 0 {
                 let name = to_wide("TaskbarIP");
                 RegDeleteValueW(hkey, name.as_ptr());
                 RegCloseKey(hkey);
@@ -94,27 +73,18 @@ fn main() {
         }
     }
 
-    // 4. Delete the original exe
-    if let Some(ref path) = exe_path {
-        let wide_path: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-        unsafe {
-            DeleteFileW(wide_path.as_ptr());
-        }
-    }
+    // 3. Delete from ProgramData shared location
+    delete_file_wide("C:\\ProgramData\\TaskbarIP\\taskbar-ip.exe");
+    delete_file_wide("C:\\ProgramData\\TaskbarIP\\uninstall.exe");
+    // Try to remove the directory (will only succeed if empty)
+    let _ = std::fs::remove_dir("C:\\ProgramData\\TaskbarIP");
 
-    // 5. Also delete shared ProgramData copy
-    let shared = "C:\\ProgramData\\TaskbarIP\\taskbar-ip.exe";
-    let wide_shared: Vec<u16> = shared.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe { DeleteFileW(wide_shared.as_ptr()); }
+    // 4. Delete from all-users Startup folder
+    delete_file_wide("C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp\\taskbar-ip.exe");
 
-    // 6. Delete from startup folders
-    let all_users = "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp\\taskbar-ip.exe";
-    let wide_all: Vec<u16> = all_users.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe { DeleteFileW(wide_all.as_ptr()); }
-
+    // 5. Delete from current-user Startup folder
     if let Ok(appdata) = std::env::var("APPDATA") {
         let user_startup = format!("{}\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\taskbar-ip.exe", appdata);
-        let wide_user: Vec<u16> = user_startup.encode_utf16().chain(std::iter::once(0)).collect();
-        unsafe { DeleteFileW(wide_user.as_ptr()); }
+        delete_file_wide(&user_startup);
     }
 }

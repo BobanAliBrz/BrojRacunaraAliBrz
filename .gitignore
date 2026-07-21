@@ -2,6 +2,9 @@
 target/
 **/*.rs.bk
 
+# Build output (populated by build.ps1)
+dist/
+
 # Windows stuff
 *.exe
 *.exe~

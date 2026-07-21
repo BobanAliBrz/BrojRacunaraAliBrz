@@ -1,10 +1,13 @@
 [package]
 name = "taskbar-ip"
-version = "0.1.0"
+version = "1.1.0"
 edition = "2021"
 
+[build-dependencies]
+embed-manifest = "=1.4.0"
+
 [dependencies]
-winapi = { version = "0.3", features = ["winuser", "wingdi", "libloaderapi", "winreg", "iphlpapi", "consoleapi", "ws2def", "tlhelp32", "handleapi", "processthreadsapi", "fileapi", "errhandlingapi", "winnt", "ntdef"] }
+winapi = { version = "0.3", features = ["winuser", "wingdi", "libloaderapi", "winreg", "iphlpapi", "consoleapi", "ws2def", "tlhelp32", "handleapi", "processthreadsapi", "fileapi", "errhandlingapi", "winnt", "ntdef", "synchapi", "minwinbase", "winerror", "securitybaseapi"] }
 
 [[bin]]
 name = "taskbar-ip"
@@ -13,3 +16,7 @@ path = "src/main.rs"
 [[bin]]
 name = "uninstall"
 path = "src/uninstall.rs"
+
+[[bin]]
+name = "setup"
+path = "src/setup.rs"
