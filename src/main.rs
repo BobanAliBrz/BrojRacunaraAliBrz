@@ -10,7 +10,7 @@ use winapi::shared::ws2def::AF_INET;
 use winapi::um::iphlpapi::GetAdaptersAddresses;
 use winapi::um::libloaderapi::{GetModuleFileNameW, GetModuleHandleW};
 use winapi::um::synchapi::CreateMutexW;
-use winapi::um::winnt::{KEY_SET_VALUE, KEY_WRITE, REG_SZ};
+use winapi::um::winnt::{KEY_SET_VALUE, KEY_WRITE, REG_DWORD, REG_SZ};
 use winapi::um::winreg::*;
 use winapi::um::winuser::*;
 use winapi::um::wingdi::*;
@@ -19,6 +19,7 @@ static mut HWND_LABEL: HWND = ptr::null_mut();
 const PADDING_X: i32 = 16;
 const WINDOW_H: i32 = 30;
 const MUTEX_NAME: &str = "Global\\TaskbarIP_SingleInstance";
+const KEY_WOW64_64KEY: DWORD = 0x0100;
 
 fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
@@ -71,9 +72,17 @@ fn file_exists_and_valid(path: &str) -> bool {
     }
 }
 
+/// Get the system ProgramData directory (e.g. C:\ProgramData)
+fn program_data_dir() -> String {
+    std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_string())
+}
+
 /// Get the all-users Startup folder path
 fn all_users_startup_path() -> String {
-    "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp\\taskbar-ip.exe".to_string()
+    format!(
+        "{}\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp\\taskbar-ip.exe",
+        program_data_dir()
+    )
 }
 
 /// Get the current-user Startup folder path
@@ -89,8 +98,9 @@ fn user_startup_path() -> Option<String> {
 /// Check if we're already running from an installed location
 fn is_running_from_install_location(exe_path: &str) -> bool {
     let norm = normalize_path(exe_path);
-    let programdata = normalize_path("C:\\ProgramData\\TaskbarIP\\");
-    let startup_all = normalize_path("C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp\\");
+    let pd = program_data_dir();
+    let programdata = normalize_path(&format!("{}\\TaskbarIP\\", pd));
+    let startup_all = normalize_path(&format!("{}\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp\\", pd));
 
     if norm.starts_with(&programdata) || norm.starts_with(&startup_all) {
         return true;
@@ -114,34 +124,101 @@ fn set_registry_autostart(exe_path: &str, admin: bool) {
     unsafe {
         let hive = if admin { HKEY_LOCAL_MACHINE } else { HKEY_CURRENT_USER };
         let subkey = to_wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-        let mut hkey: HKEY = ptr::null_mut();
-
-        let ret = RegCreateKeyExW(
-            hive,
-            subkey.as_ptr(),
-            0,
-            ptr::null_mut(),
-            0,
-            KEY_SET_VALUE | KEY_WRITE,
-            ptr::null_mut(),
-            &mut hkey,
-            ptr::null_mut(),
-        );
-        if ret != 0 { return; }
-
         let name = to_wide("TaskbarIP");
-        let value_wide = to_wide(exe_path);
+        let value_wide = to_wide(&format!("\"{}\"", exe_path));
         let byte_len = (value_wide.len() * 2) as DWORD;
 
-        RegSetValueExW(
-            hkey,
-            name.as_ptr(),
-            0,
-            REG_SZ,
-            value_wide.as_ptr() as *const u8,
-            byte_len,
-        );
-        RegCloseKey(hkey);
+        let flags_list = [
+            KEY_SET_VALUE | KEY_WRITE | KEY_WOW64_64KEY,
+            KEY_SET_VALUE | KEY_WRITE,
+        ];
+
+        for &flags in &flags_list {
+            let mut hkey: HKEY = ptr::null_mut();
+            let ret = RegCreateKeyExW(
+                hive,
+                subkey.as_ptr(),
+                0,
+                ptr::null_mut(),
+                0,
+                flags,
+                ptr::null_mut(),
+                &mut hkey,
+                ptr::null_mut(),
+            );
+            if ret == 0 && !hkey.is_null() {
+                RegSetValueExW(
+                    hkey,
+                    name.as_ptr(),
+                    0,
+                    REG_SZ,
+                    value_wide.as_ptr() as *const u8,
+                    byte_len,
+                );
+                RegCloseKey(hkey);
+            }
+        }
+    }
+}
+
+/// Register TaskbarIP in Windows Uninstall Registry key for Control Panel / Apps & Features
+fn register_uninstall_entry(exe_path: &str, admin: bool) {
+    let exe_p = std::path::Path::new(exe_path);
+    let uninstaller_path = exe_p.with_file_name("uninstall.exe");
+    let uninstaller_str = format!("\"{}\"", uninstaller_path.to_string_lossy());
+    let icon_str = format!("\"{}\"", exe_path);
+    let install_dir = exe_p.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+
+    unsafe {
+        let hive = if admin { HKEY_LOCAL_MACHINE } else { HKEY_CURRENT_USER };
+        let subkey = to_wide("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\TaskbarIP");
+
+        let flags_list = [
+            KEY_SET_VALUE | KEY_WRITE | KEY_WOW64_64KEY,
+            KEY_SET_VALUE | KEY_WRITE,
+        ];
+
+        for &flags in &flags_list {
+            let mut hkey: HKEY = ptr::null_mut();
+            let ret = RegCreateKeyExW(
+                hive,
+                subkey.as_ptr(),
+                0,
+                ptr::null_mut(),
+                0,
+                flags,
+                ptr::null_mut(),
+                &mut hkey,
+                ptr::null_mut(),
+            );
+            if ret == 0 && !hkey.is_null() {
+                let set_sz = |name: &str, val: &str| {
+                    let name_w = to_wide(name);
+                    let val_w = to_wide(val);
+                    let len = (val_w.len() * 2) as DWORD;
+                    RegSetValueExW(hkey, name_w.as_ptr(), 0, REG_SZ, val_w.as_ptr() as *const u8, len);
+                };
+
+                let set_dword = |name: &str, val: u32| {
+                    let name_w = to_wide(name);
+                    let val_bytes = val.to_ne_bytes();
+                    RegSetValueExW(hkey, name_w.as_ptr(), 0, REG_DWORD, val_bytes.as_ptr(), 4);
+                };
+
+                set_sz("DisplayName", "TaskbarIP - Broj Racunara");
+                set_sz("DisplayVersion", "1.1.0");
+                set_sz("Publisher", "TaskbarIP");
+                set_sz("UninstallString", &uninstaller_str);
+                set_sz("QuietUninstallString", &uninstaller_str);
+                set_sz("DisplayIcon", &icon_str);
+                set_sz("InstallLocation", &install_dir);
+                set_dword("NoModify", 1);
+                set_dword("NoRepair", 1);
+                set_dword("EstimatedSize", 1024);
+
+                RegCloseKey(hkey);
+            }
+        }
     }
 }
 
@@ -149,38 +226,31 @@ fn set_autostart() {
     let exe = get_module_path();
     if exe.is_empty() { return; }
 
+    let admin = is_elevated();
+    let pd = program_data_dir();
+    let shared_dir = format!("{}\\TaskbarIP", pd);
+    let shared_exe = format!("{}\\taskbar-ip.exe", shared_dir);
+    let shared_uninstaller = format!("{}\\uninstall.exe", shared_dir);
+
     // If we're already running from an installed location, don't re-install.
-    // Just make sure our persistence mechanisms are intact.
+    // Just make sure our persistence & uninstall mechanisms are intact.
     if is_running_from_install_location(&exe) {
-        // Verify registry key exists pointing to ProgramData copy
-        let shared_path = "C:\\ProgramData\\TaskbarIP\\taskbar-ip.exe";
-        if file_exists_and_valid(shared_path) {
-            let admin = is_elevated();
-            set_registry_autostart(shared_path, admin);
+        if file_exists_and_valid(&shared_exe) {
+            set_registry_autostart(&shared_exe, admin);
             if !admin {
-                set_registry_autostart(shared_path, false);
+                set_registry_autostart(&shared_exe, false);
             }
+            register_uninstall_entry(&shared_exe, admin);
         }
         return;
     }
 
     // --- First-time install (running from SMB share, USB, desktop, etc.) ---
 
-    let admin = is_elevated();
-
-    // Derive companion uninstaller path (same dir as source exe)
     let exe_path = std::path::Path::new(&exe);
     let uninstaller_src = exe_path.with_file_name("uninstall.exe");
 
-    // Step 1: Copy to ProgramData (shared, accessible by all users)
-    let shared_dir = "C:\\ProgramData\\TaskbarIP";
-    let shared_exe = format!("{}\\taskbar-ip.exe", shared_dir);
-    let shared_uninstaller = format!("{}\\uninstall.exe", shared_dir);
-
-    if let Err(_) = std::fs::create_dir_all(shared_dir) {
-        // If we can't create the dir, we can't install — bail
-        // Still try user-level install below
-    }
+    let _ = std::fs::create_dir_all(&shared_dir);
 
     // Copy main exe
     let shared_copy_ok = match std::fs::copy(&exe, &shared_exe) {
@@ -188,37 +258,36 @@ fn set_autostart() {
         Err(_) => false,
     };
 
-    // Copy uninstaller if available (best-effort)
+    // Copy uninstaller if available
     if uninstaller_src.exists() {
         let _ = std::fs::copy(&uninstaller_src, &shared_uninstaller);
     }
 
-    // Step 2: Copy to Startup folders
     if shared_copy_ok && file_exists_and_valid(&shared_exe) {
-        // Use the ProgramData copy as the source for Startup folders
-        // (more reliable than the potentially-remote SMB source)
-
         if admin {
-            // All-users Startup folder
             let all_startup = all_users_startup_path();
             let _ = std::fs::copy(&shared_exe, &all_startup);
         }
 
-        // Current-user Startup folder (always attempt)
-        if let Some(user_startup) = user_startup_path() {
-            let _ = std::fs::copy(&shared_exe, &user_startup);
-        }
-
-        // Step 3: Registry Run key (backup persistence)
         set_registry_autostart(&shared_exe, admin);
         if !admin {
             set_registry_autostart(&shared_exe, false);
         }
+        register_uninstall_entry(&shared_exe, admin);
+
+        // Remove duplicate user profile startup shortcut to avoid duplicate autostart
+        // or broken shortcuts when the user folder is renamed.
+        if let Some(user_startup) = user_startup_path() {
+            if file_exists_and_valid(&user_startup) {
+                let _ = std::fs::remove_file(&user_startup);
+            }
+        }
     } else {
-        // ProgramData copy failed — try direct user-level install
+        // Fallback to user-level location if ProgramData is not writable
         if let Some(user_startup) = user_startup_path() {
             if std::fs::copy(&exe, &user_startup).is_ok() {
                 set_registry_autostart(&user_startup, false);
+                register_uninstall_entry(&user_startup, false);
             }
         }
     }
@@ -272,20 +341,84 @@ fn get_first_ipv4() -> String {
     }
 }
 
+/// Detect if running on Windows 7 or earlier
+fn is_windows_7_or_lower() -> bool {
+    unsafe {
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct OSVERSIONINFOEXW {
+            dwOSVersionInfoSize: DWORD,
+            dwMajorVersion: DWORD,
+            dwMinorVersion: DWORD,
+            dwBuildNumber: DWORD,
+            dwPlatformId: DWORD,
+            szCSDVersion: [u16; 128],
+            wServicePackMajor: u16,
+            wServicePackMinor: u16,
+            wSuiteMask: u16,
+            wProductType: u8,
+            wReserved: u8,
+        }
+        type RtlGetVersionFn = unsafe extern "system" fn(*mut OSVERSIONINFOEXW) -> i32;
+
+        let ntdll = GetModuleHandleW(to_wide("ntdll.dll").as_ptr());
+        if !ntdll.is_null() {
+            let proc_name = std::ffi::CString::new("RtlGetVersion").unwrap();
+            let proc = winapi::um::libloaderapi::GetProcAddress(ntdll, proc_name.as_ptr());
+            if !proc.is_null() {
+                let rtl_get_version: RtlGetVersionFn = std::mem::transmute(proc);
+                let mut osvi: OSVERSIONINFOEXW = std::mem::zeroed();
+                osvi.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOEXW>() as DWORD;
+                if rtl_get_version(&mut osvi) == 0 {
+                    // Windows 7 is Major 6, Minor 1. Windows Vista is Major 6, Minor 0.
+                    return osvi.dwMajorVersion < 6 || (osvi.dwMajorVersion == 6 && osvi.dwMinorVersion <= 1);
+                }
+            }
+        }
+        false
+    }
+}
+
 fn find_tray_pos(window_w: i32) -> (i32, i32) {
     unsafe {
         let mut work_area: RECT = mem::zeroed();
         SystemParametersInfoW(0x0030, 0, &mut work_area as *mut _ as *mut winapi::ctypes::c_void, 0);
+
         let taskbar = FindWindowW(to_wide("Shell_TrayWnd").as_ptr(), ptr::null_mut());
         if taskbar.is_null() { return (work_area.right - window_w, work_area.bottom - 30); }
+
         let tray = FindWindowExW(taskbar, ptr::null_mut(), to_wide("TrayNotifyWnd").as_ptr(), ptr::null_mut());
         if tray.is_null() { return (work_area.right - window_w, work_area.bottom - 30); }
+
         let mut tray_rc: RECT = mem::zeroed();
-        if GetWindowRect(tray, &mut tray_rc) != 0 {
-            let y = tray_rc.top + (tray_rc.bottom - tray_rc.top - 30) / 2;
-            return (tray_rc.left - window_w, y);
+        if GetWindowRect(tray, &mut tray_rc) == 0 {
+            return (work_area.right - window_w, work_area.bottom - 30);
         }
-        (work_area.right - window_w, work_area.bottom - 30)
+
+        let mut min_left = tray_rc.left;
+
+        // Check if Language Bar (CiceroUIWndFrame) is visible and docked next to the tray
+        let lang_bar = FindWindowW(to_wide("CiceroUIWndFrame").as_ptr(), ptr::null_mut());
+        if !lang_bar.is_null() && IsWindowVisible(lang_bar) != 0 {
+            let mut lang_rc: RECT = mem::zeroed();
+            if GetWindowRect(lang_bar, &mut lang_rc) != 0 {
+                // Check if language bar is on the taskbar area vertically
+                if lang_rc.top >= tray_rc.top - 10 && lang_rc.bottom <= tray_rc.bottom + 10 {
+                    if lang_rc.left < min_left && lang_rc.left > 0 {
+                        min_left = lang_rc.left;
+                    }
+                }
+            }
+        }
+
+        // On Windows 7 or lower, add an extra 16px margin to the left
+        // to avoid covering the Windows 7 language selector ("EN", "SR", etc.) or tray edge
+        if is_windows_7_or_lower() {
+            min_left -= 16;
+        }
+
+        let y = tray_rc.top + (tray_rc.bottom - tray_rc.top - 30) / 2;
+        (min_left - window_w, y)
     }
 }
 
@@ -326,7 +459,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM
             let tw = measure_text(&text);
             let w = tw + PADDING_X;
             let (x, y) = find_tray_pos(w);
-            SetWindowPos(hwnd, ptr::null_mut(), x, y, w, WINDOW_H,
+            SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, WINDOW_H,
                 SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_NOREDRAW);
             let wide = to_wide(&text);
             SetWindowTextW(HWND_LABEL, wide.as_ptr());
@@ -374,7 +507,7 @@ fn main() {
         let (x, y) = find_tray_pos(w);
         let taskbar = FindWindowW(to_wide("Shell_TrayWnd").as_ptr(), ptr::null_mut());
         let _hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW,
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             name.as_ptr(), to_wide("Broj Racunara").as_ptr(),
             WS_POPUP | WS_VISIBLE,
             x, y, w, WINDOW_H,

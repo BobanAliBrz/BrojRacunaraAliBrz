@@ -10,9 +10,10 @@ use winapi::um::handleapi::CloseHandle;
 use winapi::um::tlhelp32::*;
 use winapi::um::processthreadsapi::*;
 use winapi::um::fileapi::*;
-use winapi::um::winnt::PROCESS_TERMINATE;
+use winapi::um::winnt::{PROCESS_TERMINATE, KEY_SET_VALUE};
 
 const INVALID_HANDLE_VALUE: HANDLE = !0 as HANDLE;
+const KEY_WOW64_64KEY: DWORD = 0x0100;
 
 fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
@@ -50,39 +51,61 @@ fn delete_file_wide(path: &str) {
     unsafe { DeleteFileW(wide.as_ptr()); }
 }
 
+fn program_data_dir() -> String {
+    std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_string())
+}
+
 fn main() {
     // 1. Kill any running taskbar-ip.exe
     kill_processes_by_name("taskbar-ip.exe");
 
-    // Give processes a moment to terminate
+    // Brief wait for process handles to release
     unsafe {
         winapi::um::synchapi::Sleep(500);
     }
 
-    // 2. Remove registry keys from both HKLM (all users) and HKCU (current user)
+    // 2. Remove autostart and uninstall registry keys from both HKLM and HKCU
     unsafe {
-        for &hive in &[HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
-            let mut hkey: HKEY = ptr::null_mut();
-            let path = to_wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-            // KEY_SET_VALUE = 0x0002 — need write access to delete values
-            if RegOpenKeyExW(hive, path.as_ptr(), 0, 0x0002, &mut hkey) == 0 {
-                let name = to_wide("TaskbarIP");
-                RegDeleteValueW(hkey, name.as_ptr());
-                RegCloseKey(hkey);
+        let hives = [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER];
+        let flags_list = [
+            KEY_SET_VALUE | KEY_WOW64_64KEY,
+            KEY_SET_VALUE,
+        ];
+
+        let run_path = to_wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+        let uninstall_parent = to_wide("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall");
+        let app_name = to_wide("TaskbarIP");
+
+        for &hive in &hives {
+            for &flags in &flags_list {
+                // Delete autostart value
+                let mut hkey: HKEY = ptr::null_mut();
+                if RegOpenKeyExW(hive, run_path.as_ptr(), 0, flags, &mut hkey) == 0 {
+                    RegDeleteValueW(hkey, app_name.as_ptr());
+                    RegCloseKey(hkey);
+                }
+
+                // Delete Control Panel Uninstall key
+                let mut hkey_uninst: HKEY = ptr::null_mut();
+                if RegOpenKeyExW(hive, uninstall_parent.as_ptr(), 0, flags, &mut hkey_uninst) == 0 {
+                    RegDeleteKeyW(hkey_uninst, app_name.as_ptr());
+                    RegCloseKey(hkey_uninst);
+                }
             }
         }
     }
 
     // 3. Delete from ProgramData shared location
-    delete_file_wide("C:\\ProgramData\\TaskbarIP\\taskbar-ip.exe");
-    delete_file_wide("C:\\ProgramData\\TaskbarIP\\uninstall.exe");
-    // Try to remove the directory (will only succeed if empty)
-    let _ = std::fs::remove_dir("C:\\ProgramData\\TaskbarIP");
+    let pd = program_data_dir();
+    let shared_dir = format!("{}\\TaskbarIP", pd);
+    delete_file_wide(&format!("{}\\taskbar-ip.exe", shared_dir));
+    delete_file_wide(&format!("{}\\uninstall.exe", shared_dir));
+    let _ = std::fs::remove_dir(&shared_dir);
 
-    // 4. Delete from all-users Startup folder
-    delete_file_wide("C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp\\taskbar-ip.exe");
+    // 4. Delete from All Users Startup folder
+    delete_file_wide(&format!("{}\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp\\taskbar-ip.exe", pd));
 
-    // 5. Delete from current-user Startup folder
+    // 5. Delete from Current User Startup folder
     if let Ok(appdata) = std::env::var("APPDATA") {
         let user_startup = format!("{}\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\taskbar-ip.exe", appdata);
         delete_file_wide(&user_startup);

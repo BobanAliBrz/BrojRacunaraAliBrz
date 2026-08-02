@@ -31,22 +31,28 @@ Instead of copying raw `.exe` files manually across SMB shares, `dist\setup.exe`
 2. **Architecture Detection**: Detects if the host OS is 32-bit or 64-bit (via `PROCESSOR_ARCHITEW6432` / `PROCESSOR_ARCHITECTURE` environment checks).
 3. **Extraction & Launch**:
    - Stops existing instances via `taskkill`.
-   - Extracts binaries to `C:\ProgramData\TaskbarIP\` (or `%LOCALAPPDATA%\TaskbarIP\` fallback).
-   - Spawns the main executable, which self-registers for autostart.
+   - Extracts binaries to `%ProgramData%\TaskbarIP\` (or `%LOCALAPPDATA%\TaskbarIP\` fallback).
+   - Spawns the main executable, which self-registers for autostart and Control Panel uninstallation.
 4. **User Feedback**: Native Win32 GUI message boxes report success or errors without requiring a CLI.
 
 ---
 
-## Persistence & Autostart Mechanism
+## Persistence, Control Panel Uninstall, & Win7 Specifics
 
-To prevent "random uninstallation" (which occurred when running directly off SMB shares with flaky network paths or when re-copying over locked binaries), `set_autostart()` in [main.rs](file:///c:/Coding/Skibidi/taskbar-ip/src/main.rs) implements a robust persistence layer:
+### 1. Robust Autostart & Profile Independence
+- **Dynamic ProgramData Pathing**: Uses `%ProgramData%` to insulate installation from user profile paths (`C:\Users\Username`). Renaming user profile folders will not affect autostart.
+- **64-bit Registry Access**: Uses `KEY_WOW64_64KEY` (0x0100) when accessing `HKLM` & `HKCU` `Software\Microsoft\Windows\CurrentVersion\Run` so 32-bit builds on 64-bit OS write directly to native 64-bit registry run keys.
+- **User Startup Cleanup**: Removes duplicate startup entries in `%APPDATA%\...\Startup\` when `%ProgramData%` autostart is active.
+- **Single-Instance Enforcement**: Named Windows Mutex (`Global\TaskbarIP_SingleInstance`) prevents duplicate taskbar windows if launched multiple times.
 
-1. **Already Installed Guard**: If `get_module_path()` is already inside `C:\ProgramData\TaskbarIP` or Startup directories, copy loops are skipped.
-2. **Local ProgramData Staging**: When run from an external location (e.g. SMB share, USB stick), it first copies the executable to local disk (`C:\ProgramData\TaskbarIP\taskbar-ip.exe`) before registering autostart entries.
-3. **Dual Persistence Layers**:
-   - **Startup Folder**: All-Users (`C:\ProgramData\...\StartUp\`) when elevated; Current-User (`%APPDATA%\...\Startup\`) always.
-   - **Registry `Run` Key**: `HKLM\Software\Microsoft\Windows\CurrentVersion\Run` when elevated; `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` always.
-4. **Single-Instance Enforcement**: Named Windows Mutex (`Global\TaskbarIP_SingleInstance`) prevents duplicate taskbar windows if both registry and startup folder launch the app simultaneously.
+### 2. Control Panel / Apps & Features Uninstallation
+- Registers in `Software\Microsoft\Windows\CurrentVersion\Uninstall\TaskbarIP` (`HKLM` when admin, `HKCU` when standard user).
+- Sets `DisplayName` ("TaskbarIP - Broj Racunara"), `UninstallString`, `DisplayIcon`, `Publisher`, `NoModify`, `NoRepair`, etc.
+- Clicking "Uninstall" in Windows Settings ("Apps & Features") or Control Panel ("Programs and Features") launches `uninstall.exe`.
+
+### 3. Windows 7 Z-Order & Language Selector Positioning
+- **Z-Order Topmost**: Created with `WS_EX_TOPMOST` and updated via `SetWindowPos(hwnd, HWND_TOPMOST, ...)`, staying above `Shell_TrayWnd` on Windows 7 DWM composition.
+- **Language Bar Avoidance**: Detects `CiceroUIWndFrame` (Windows Language Bar). On Windows 7 (`RtlGetVersion` major 6, minor 1), applies an extra left margin offset so the IP text never covers or overlaps the Windows 7 Language Selector ("EN", "SR", etc.).
 
 ---
 
@@ -59,11 +65,11 @@ taskbar-ip/
 ├── build.ps1           # Multi-architecture build pipeline script
 ├── Cargo.toml          # Package definitions & dependencies
 ├── src/
-│   ├── main.rs         # Taskbar IP app (~270 lines)
-│   ├── setup.rs        # Auto-detecting installer (~140 lines)
-│   └── uninstall.rs    # Complete uninstaller (~90 lines)
+│   ├── main.rs         # Taskbar IP app (~450 lines)
+│   ├── setup.rs        # Auto-detecting installer (~220 lines)
+│   └── uninstall.rs    # Complete uninstaller (~100 lines)
 └── dist/               # Build output directory
-    ├── setup.exe       # Complete single-file installer (~1.3 MB)
+    ├── setup.exe       # Complete single-file installer (~1.35 MB)
     ├── taskbar-ip-x64.exe
     ├── taskbar-ip-x86.exe
     ├── uninstall-x64.exe
