@@ -411,10 +411,12 @@ fn find_tray_pos(window_w: i32) -> (i32, i32) {
             }
         }
 
-        // On Windows 7 or lower, add an extra 16px margin to the left
+        // On Windows 7 or lower, add an extra 75px margin to the left
         // to avoid covering the Windows 7 language selector ("EN", "SR", etc.) or tray edge
         if is_windows_7_or_lower() {
-            min_left -= 16;
+            min_left -= 75;
+        } else if !lang_bar.is_null() && IsWindowVisible(lang_bar) != 0 {
+            min_left -= 12;
         }
 
         let y = tray_rc.top + (tray_rc.bottom - tray_rc.top - 30) / 2;
@@ -460,7 +462,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM
             let w = tw + PADDING_X;
             let (x, y) = find_tray_pos(w);
             SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, WINDOW_H,
-                SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_NOREDRAW);
+                SWP_NOACTIVATE | SWP_NOSENDCHANGING);
             let wide = to_wide(&text);
             SetWindowTextW(HWND_LABEL, wide.as_ptr());
             SetWindowPos(HWND_LABEL, ptr::null_mut(), 0, 0, w, WINDOW_H, SWP_NOZORDER | SWP_NOREDRAW);
@@ -506,12 +508,22 @@ fn main() {
         let w = tw + PADDING_X;
         let (x, y) = find_tray_pos(w);
         let taskbar = FindWindowW(to_wide("Shell_TrayWnd").as_ptr(), ptr::null_mut());
+        
+        // On Windows 7 or earlier, setting hwndParent to taskbar causes DWM to layer the window
+        // UNDER Shell_TrayWnd. Setting parent to NULL creates an un-owned HWND_TOPMOST window
+        // that sits cleanly ABOVE the taskbar on Windows 7.
+        let parent_hwnd = if is_windows_7_or_lower() {
+            ptr::null_mut()
+        } else {
+            taskbar
+        };
+
         let _hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
             name.as_ptr(), to_wide("Broj Racunara").as_ptr(),
             WS_POPUP | WS_VISIBLE,
             x, y, w, WINDOW_H,
-            taskbar,
+            parent_hwnd,
             ptr::null_mut(),
             GetModuleHandleW(ptr::null_mut()),
             ptr::null_mut(),
