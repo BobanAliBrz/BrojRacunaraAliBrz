@@ -1,83 +1,85 @@
-# TaskbarIP — Project Memory
+# TaskbarIP Project Memory
 
-## What It Is
+## Purpose
 
-A minimal Rust Windows application that displays "Broj Racunara: [IP]" in the taskbar area, immediately to the left of the system notification tray (clock, volume, network icons). It auto-starts on login, requires zero configuration, and has zero external dependencies (no .NET, no VC++ Redistributable).
+TaskbarIP is a small Rust/Win32 application that shows `Broj Racunara: <IPv4>`
+immediately left of the Windows notification area. It updates every second,
+autostarts after installation, and has no .NET or Visual C++ Redistributable
+requirement.
 
----
+For the record of user-visible and maintenance changes, see [changelog.md](changelog.md).
 
-## Architecture & Cross-Windows Compatibility
+## Compatibility contract
 
-### Target Windows Versions
-- **Windows 7 (32-bit & 64-bit)** (SP1 + all updates)
-- **Windows 8 / 8.1 (32-bit & 64-bit)**
-- **Windows 10 / 11 (32-bit & 64-bit)**
+- Support Windows 7 SP1 through Windows 11, on both 32-bit and 64-bit systems.
+- Build with Rust `1.77.2` for legacy Windows compatibility.
+- Produce `i686-pc-windows-msvc` and `x86_64-pc-windows-msvc` binaries.
+- Statically link the MSVC runtime (`-Ctarget-feature=+crt-static`) so no VC++
+  runtime installation is required.
+- `build.rs` embeds the application manifest for Common Controls v6, DPI
+  awareness, and the UTF-8 code page.
 
-### Toolchain & Runtime Strategy
-- **Compiler**: Rust `1.77.2` (the final official release with robust legacy Windows support prior to API requirement bumps).
-- **Targets**: `x86_64-pc-windows-msvc` (64-bit) and `i686-pc-windows-msvc` (32-bit).
-- **C Runtime**: Statically linked (`-Ctarget-feature=+crt-static`), avoiding VC++ Redistributable dependency.
-- **Manifest**: Embedded via `embed-manifest` (`1.4.0`) for DPI awareness, UTF-8 code page, and Common Controls v6.
+## Overlay behavior
 
----
+- `src/main.rs` obtains the preferred active IPv4 address and refreshes the
+  label once per second.
+- The overlay is a non-activating, topmost popup. Its `STATIC` child has a
+  white background, centered text, and uses the same Segoe UI font for drawing
+  and width measurement. Keep this pairing intact so the text remains centered
+  and does not wrap.
+- The window is positioned immediately left of `TrayNotifyWnd`.
+- A global mutex (`Global\\TaskbarIP_SingleInstance`) prevents duplicates.
 
-## Single-File Auto-Detecting Installer (`setup.exe`)
+### Windows 7 z-order rule
 
-Instead of copying raw `.exe` files manually across SMB shares, `dist\setup.exe` acts as a self-extracting, single-file installer:
+Windows 7 treats a taskbar-owned popup differently from newer Windows
+versions: it can render the popup behind `Shell_TrayWnd`. When
+`is_windows_7_or_lower()` is true, create the popup with no owner (`NULL`) and
+use both `WS_EX_TOPMOST` and `SetWindowPos(..., HWND_TOPMOST, ...)`. Do not
+change this to taskbar ownership without testing Windows 7.
 
-1. **Embedded Binaries**: Uses `include_bytes!` to embed:
-   - `taskbar-ip-x86.exe` & `taskbar-ip-x64.exe`
-   - `uninstall-x86.exe` & `uninstall-x64.exe`
-2. **Architecture Detection**: Detects if the host OS is 32-bit or 64-bit (via `PROCESSOR_ARCHITEW6432` / `PROCESSOR_ARCHITECTURE` environment checks).
-3. **Extraction & Launch**:
-   - Stops existing instances via `taskkill`.
-   - Extracts binaries to `%ProgramData%\TaskbarIP\` (or `%LOCALAPPDATA%\TaskbarIP\` fallback).
-   - Spawns the main executable, which self-registers for autostart and Control Panel uninstallation.
-4. **User Feedback**: Native Win32 GUI message boxes report success or errors without requiring a CLI.
+The same code reserves an additional 75 px to the left on Windows 7 to avoid
+the language selector. It also detects a visible `CiceroUIWndFrame` language
+bar for positioning on other supported versions.
 
----
+## Installation and persistence
 
-## Persistence, Control Panel Uninstall, & Win7 Specifics
+`setup.exe` is a self-extracting installer, not merely a launcher:
 
-### 1. Robust Autostart & Profile Independence
-- **Dynamic ProgramData Pathing**: Uses `%ProgramData%` to insulate installation from user profile paths (`C:\Users\Username`). Renaming user profile folders will not affect autostart.
-- **64-bit Registry Access**: Uses `KEY_WOW64_64KEY` (0x0100) when accessing `HKLM` & `HKCU` `Software\Microsoft\Windows\CurrentVersion\Run` so 32-bit builds on 64-bit OS write directly to native 64-bit registry run keys.
-- **User Startup Cleanup**: Removes duplicate startup entries in `%APPDATA%\...\Startup\` when `%ProgramData%` autostart is active.
-- **Single-Instance Enforcement**: Named Windows Mutex (`Global\TaskbarIP_SingleInstance`) prevents duplicate taskbar windows if launched multiple times.
+1. It embeds the x86/x64 app and uninstaller binaries.
+2. It detects the host architecture and extracts the correct pair to
+   `%ProgramData%\\TaskbarIP` (with a local-app-data fallback).
+3. It starts the app; the app configures autostart and the uninstall entry.
 
-### 2. Control Panel / Apps & Features Uninstallation
-- Registers in `Software\Microsoft\Windows\CurrentVersion\Uninstall\TaskbarIP` (`HKLM` when admin, `HKCU` when standard user).
-- Sets `DisplayName` ("TaskbarIP - Broj Racunara"), `UninstallString`, `DisplayIcon`, `Publisher`, `NoModify`, `NoRepair`, etc.
-- Clicking "Uninstall" in Windows Settings ("Apps & Features") or Control Panel ("Programs and Features") launches `uninstall.exe`.
+The app prefers `%ProgramData%` paths to remain valid if a user profile is
+renamed. It writes Run and uninstall registry entries to HKLM when elevated or
+HKCU otherwise. `KEY_WOW64_64KEY` ensures a 32-bit build writes to the native
+64-bit registry view on 64-bit Windows. The uninstaller removes the installed
+files, startup registrations, and uninstall registration.
 
-### 3. Windows 7 Z-Order & Language Selector Positioning
-- **Z-Order Topmost**: Created with `WS_EX_TOPMOST` and updated via `SetWindowPos(hwnd, HWND_TOPMOST, ...)`, staying above `Shell_TrayWnd` on Windows 7 DWM composition.
-- **Language Bar Avoidance**: Detects `CiceroUIWndFrame` (Windows Language Bar). On Windows 7 (`RtlGetVersion` major 6, minor 1), applies an extra left margin offset so the IP text never covers or overlaps the Windows 7 Language Selector ("EN", "SR", etc.).
+## Development workflow
 
----
+| Task | Command or file |
+| --- | --- |
+| Fast visual preview | `preview-overlay.bat` or `./test-overlay.ps1` |
+| Stop preview | `stop-preview-overlay.bat` or `./test-overlay.ps1 -Stop` |
+| Full x86/x64 build and installer | `powershell -ExecutionPolicy Bypass -File ./build.ps1` |
+| Check the 32-bit target | `cargo +1.77.2 check --target i686-pc-windows-msvc --bin taskbar-ip` |
 
-## Project Structure & Build
+Preview mode sets `TASKBAR_IP_PREVIEW=1`; this intentionally skips autostart
+and uninstall registration. The preview launcher stops any currently running
+TaskbarIP process first, including an installed copy.
 
-```
-taskbar-ip/
-├── .cargo/config.toml  # Static CRT flags for msvc targets
-├── build.rs            # Manifest embedding & dist/ placeholder generator
-├── build.ps1           # Multi-architecture build pipeline script
-├── Cargo.toml          # Package definitions & dependencies
-├── src/
-│   ├── main.rs         # Taskbar IP app (~450 lines)
-│   ├── setup.rs        # Auto-detecting installer (~220 lines)
-│   └── uninstall.rs    # Complete uninstaller (~100 lines)
-└── dist/               # Build output directory
-    ├── setup.exe       # Complete single-file installer (~1.35 MB)
-    ├── taskbar-ip-x64.exe
-    ├── taskbar-ip-x86.exe
-    ├── uninstall-x64.exe
-    └── uninstall-x86.exe
-```
+## Key files
 
-### Build Commands
-To generate the release binaries and installer:
-```powershell
-powershell -ExecutionPolicy Bypass -File .\build.ps1
+```text
+.cargo/config.toml       Static CRT settings for both MSVC targets
+build.ps1                Full multi-architecture build and packaging script
+test-overlay.ps1         Build/run or stop a non-installing visual preview
+preview-overlay.bat      Double-click preview launcher
+stop-preview-overlay.bat Double-click preview stop launcher
+src/main.rs              Overlay, positioning, autostart, and registration
+src/setup.rs             Architecture-detecting self-extracting installer
+src/uninstall.rs         Uninstall and cleanup logic
+changelog.md             Maintained change history
 ```
