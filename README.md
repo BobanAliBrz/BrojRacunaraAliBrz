@@ -58,6 +58,25 @@ cargo build --release
 
 Outputs `target/release/taskbar-ip.exe` (128 KB) and `target/release/uninstall.exe` (119 KB).
 
+### Preview the overlay during development
+
+To rebuild and launch only the overlay (without building or running `setup.exe`):
+
+```powershell
+.\test-overlay.ps1
+```
+
+The preview does not install itself, configure autostart, or modify uninstall entries. It stops any
+existing TaskbarIP overlay first, so the freshly built version is visible immediately. Close the
+preview with:
+
+```powershell
+.\test-overlay.ps1 -Stop
+```
+
+For double-click testing, use `preview-overlay.bat` to rebuild and start the preview, and
+`stop-preview-overlay.bat` to close it.
+
 ## Project Structure
 
 ```

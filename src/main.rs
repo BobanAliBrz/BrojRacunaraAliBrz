@@ -5,7 +5,7 @@ use std::mem;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 use winapi::shared::minwindef::{DWORD, HKEY, LPARAM, LRESULT, UINT, WPARAM};
-use winapi::shared::windef::{HWND, RECT};
+use winapi::shared::windef::{HFONT, HWND, RECT};
 use winapi::shared::ws2def::AF_INET;
 use winapi::um::iphlpapi::GetAdaptersAddresses;
 use winapi::um::libloaderapi::{GetModuleFileNameW, GetModuleHandleW};
@@ -16,10 +16,16 @@ use winapi::um::winuser::*;
 use winapi::um::wingdi::*;
 
 static mut HWND_LABEL: HWND = ptr::null_mut();
-const PADDING_X: i32 = 16;
+static mut LABEL_FONT: HFONT = ptr::null_mut();
+const PADDING_X: i32 = 6;
 const WINDOW_H: i32 = 30;
 const MUTEX_NAME: &str = "Global\\TaskbarIP_SingleInstance";
 const KEY_WOW64_64KEY: DWORD = 0x0100;
+
+/// Preview builds must not install themselves or change the machine's startup settings.
+fn is_preview_mode() -> bool {
+    std::env::var("TASKBAR_IP_PREVIEW").as_deref() == Ok("1")
+}
 
 fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
@@ -427,13 +433,18 @@ fn find_tray_pos(window_w: i32) -> (i32, i32) {
 fn measure_text(text: &str) -> i32 {
     unsafe {
         let hdc = GetDC(ptr::null_mut());
-        let font = CreateFontW(15, 0, 0, 0, 600, 0, 0, 0, 0, 0, 0, 0, 0, to_wide("Segoe UI").as_ptr());
-        let old_font = SelectObject(hdc, font as *mut _);
+        // Measure with the exact font assigned to the label. This keeps the
+        // background snug and leaves enough room for the text to stay on one line.
+        let font = if LABEL_FONT.is_null() {
+            GetStockObject(DEFAULT_GUI_FONT as i32)
+        } else {
+            LABEL_FONT as *mut _
+        };
+        let old_font = SelectObject(hdc, font);
         let mut rc: RECT = RECT { left: 0, top: 0, right: 0, bottom: 0 };
         let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
         DrawTextW(hdc, wide.as_ptr(), wide.len() as i32 - 1, &mut rc, DT_CALCRECT | DT_SINGLELINE);
         SelectObject(hdc, old_font);
-        DeleteObject(font as *mut _);
         ReleaseDC(ptr::null_mut(), hdc);
         rc.right - rc.left
     }
@@ -443,9 +454,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM
     match msg {
         WM_CREATE => {
             let label = CreateWindowExW(0, to_wide("STATIC").as_ptr(), to_wide("...").as_ptr(),
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 100, WINDOW_H, hwnd,
+                WS_CHILD | WS_VISIBLE | SS_CENTER | SS_CENTERIMAGE | SS_NOPREFIX,
+                0, 0, 100, WINDOW_H, hwnd,
                 ptr::null_mut(), GetModuleHandleW(ptr::null_mut()), ptr::null_mut());
             HWND_LABEL = label;
+            if !LABEL_FONT.is_null() {
+                SendMessageW(label, WM_SETFONT, LABEL_FONT as WPARAM, 1);
+            }
             SetTimer(hwnd, 1, 1000, None);
             0
         }
@@ -459,7 +474,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM
             let ip = get_first_ipv4();
             let text = format!("Broj Racunara: {}", ip);
             let tw = measure_text(&text);
-            let w = tw + PADDING_X;
+            let w = tw + PADDING_X * 2;
             let (x, y) = find_tray_pos(w);
             SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, WINDOW_H,
                 SWP_NOACTIVATE | SWP_NOSENDCHANGING);
@@ -469,7 +484,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM
             InvalidateRect(hwnd, ptr::null_mut(), 0);
             0
         }
-        WM_DESTROY => { PostQuitMessage(0); 0 }
+        WM_DESTROY => {
+            if !LABEL_FONT.is_null() {
+                DeleteObject(LABEL_FONT as *mut _);
+                LABEL_FONT = ptr::null_mut();
+            }
+            PostQuitMessage(0);
+            0
+        }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
@@ -486,9 +508,15 @@ fn main() {
         // Don't close the handle — keep it alive for the process lifetime
     }
 
-    set_autostart();
+    if !is_preview_mode() {
+        set_autostart();
+    }
 
     unsafe {
+        LABEL_FONT = CreateFontW(
+            15, 0, 0, 0, 600, 0, 0, 0, 0, 0, 0, 0, 0,
+            to_wide("Segoe UI").as_ptr(),
+        );
         let name = to_wide("TaskbarIPC");
         let wc = WNDCLASSW {
             style: 0,
@@ -505,7 +533,7 @@ fn main() {
         let ip = get_first_ipv4();
         let text = format!("Broj Racunara: {}", ip);
         let tw = measure_text(&text);
-        let w = tw + PADDING_X;
+        let w = tw + PADDING_X * 2;
         let (x, y) = find_tray_pos(w);
         let taskbar = FindWindowW(to_wide("Shell_TrayWnd").as_ptr(), ptr::null_mut());
         
