@@ -4,12 +4,19 @@ use std::ffi::OsStr;
 use std::mem;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
+use sha2::{Digest, Sha256};
 use winapi::shared::minwindef::{DWORD, HKEY, LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HFONT, HWND, RECT};
 use winapi::shared::ws2def::AF_INET;
 use winapi::um::iphlpapi::GetAdaptersAddresses;
 use winapi::um::libloaderapi::{GetModuleFileNameW, GetModuleHandleW};
 use winapi::um::synchapi::CreateMutexW;
+use winapi::um::winhttp::{
+    WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest,
+    WinHttpQueryDataAvailable, WinHttpReadData, WinHttpReceiveResponse,
+    WinHttpSendRequest, WinHttpSetTimeouts, INTERNET_DEFAULT_HTTPS_PORT,
+    WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE,
+};
 use winapi::um::winnt::{KEY_SET_VALUE, KEY_WRITE, REG_DWORD, REG_SZ};
 use winapi::um::winreg::*;
 use winapi::um::winuser::*;
@@ -21,6 +28,10 @@ const PADDING_X: i32 = 6;
 const WINDOW_H: i32 = 30;
 const MUTEX_NAME: &str = "Global\\TaskbarIP_SingleInstance";
 const KEY_WOW64_64KEY: DWORD = 0x0100;
+const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const UPDATE_API_HOST: &str = "api.github.com";
+const UPDATE_API_PATH: &str = "/repos/BobanAliBrz/BrojRacunaraAliBrz/releases/latest";
+const UPDATE_DOWNLOAD_HOST: &str = "github.com";
 
 /// Preview builds must not install themselves or change the machine's startup settings.
 fn is_preview_mode() -> bool {
@@ -83,6 +94,10 @@ fn program_data_dir() -> String {
     std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_string())
 }
 
+fn local_install_dir() -> Option<String> {
+    std::env::var("LOCALAPPDATA").ok().map(|local| format!("{}\\TaskbarIP", local))
+}
+
 /// Get the all-users Startup folder path
 fn all_users_startup_path() -> String {
     format!(
@@ -110,6 +125,12 @@ fn is_running_from_install_location(exe_path: &str) -> bool {
 
     if norm.starts_with(&programdata) || norm.starts_with(&startup_all) {
         return true;
+    }
+
+    if let Some(local_install) = local_install_dir() {
+        if norm.starts_with(&normalize_path(&format!("{}\\", local_install))) {
+            return true;
+        }
     }
 
     // Check current-user startup
@@ -212,7 +233,7 @@ fn register_uninstall_entry(exe_path: &str, admin: bool) {
                 };
 
                 set_sz("DisplayName", "TaskbarIP - Broj Racunara");
-                set_sz("DisplayVersion", "1.1.0");
+                set_sz("DisplayVersion", CURRENT_VERSION);
                 set_sz("Publisher", "TaskbarIP");
                 set_sz("UninstallString", &uninstaller_str);
                 set_sz("QuietUninstallString", &uninstaller_str);
@@ -241,13 +262,14 @@ fn set_autostart() {
     // If we're already running from an installed location, don't re-install.
     // Just make sure our persistence & uninstall mechanisms are intact.
     if is_running_from_install_location(&exe) {
-        if file_exists_and_valid(&shared_exe) {
-            set_registry_autostart(&shared_exe, admin);
-            if !admin {
-                set_registry_autostart(&shared_exe, false);
-            }
-            register_uninstall_entry(&shared_exe, admin);
+        // Keep a per-user install in its writable location. This is necessary
+        // for silent updates without requiring elevation.
+        let installed_as_admin = admin && normalize_path(&exe).starts_with(&normalize_path(&shared_dir));
+        set_registry_autostart(&exe, installed_as_admin);
+        if !installed_as_admin {
+            set_registry_autostart(&exe, false);
         }
+        register_uninstall_entry(&exe, installed_as_admin);
         return;
     }
 
@@ -299,6 +321,208 @@ fn set_autostart() {
     }
 }
 
+/// Fetch an HTTPS resource without blocking the overlay's UI thread.
+/// WinHTTP is present on every supported Windows version and uses the system
+/// proxy and certificate store.
+fn https_get(host: &str, path: &str, max_bytes: usize) -> Option<Vec<u8>> {
+    unsafe {
+        let agent = to_wide(&format!("TaskbarIP/{}", CURRENT_VERSION));
+        let session = WinHttpOpen(
+            agent.as_ptr(),
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            ptr::null(),
+            ptr::null(),
+            0,
+        );
+        if session.is_null() {
+            return None;
+        }
+        let _ = WinHttpSetTimeouts(session, 5_000, 5_000, 10_000, 20_000);
+
+        let host_w = to_wide(host);
+        let connection = WinHttpConnect(session, host_w.as_ptr(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+        if connection.is_null() {
+            WinHttpCloseHandle(session);
+            return None;
+        }
+
+        let method = to_wide("GET");
+        let path_w = to_wide(path);
+        let request = WinHttpOpenRequest(
+            connection,
+            method.as_ptr(),
+            path_w.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null_mut(),
+            WINHTTP_FLAG_SECURE,
+        );
+        if request.is_null() {
+            WinHttpCloseHandle(connection);
+            WinHttpCloseHandle(session);
+            return None;
+        }
+
+        let sent = WinHttpSendRequest(request, ptr::null(), 0, ptr::null_mut(), 0, 0, 0);
+        let received = sent != 0 && WinHttpReceiveResponse(request, ptr::null_mut()) != 0;
+        if !received {
+            WinHttpCloseHandle(request);
+            WinHttpCloseHandle(connection);
+            WinHttpCloseHandle(session);
+            return None;
+        }
+
+        let mut body = Vec::new();
+        loop {
+            let mut available: DWORD = 0;
+            if WinHttpQueryDataAvailable(request, &mut available) == 0 {
+                WinHttpCloseHandle(request);
+                WinHttpCloseHandle(connection);
+                WinHttpCloseHandle(session);
+                return None;
+            }
+            if available == 0 {
+                break;
+            }
+            if body.len().saturating_add(available as usize) > max_bytes {
+                WinHttpCloseHandle(request);
+                WinHttpCloseHandle(connection);
+                WinHttpCloseHandle(session);
+                return None;
+            }
+
+            let start = body.len();
+            body.resize(start + available as usize, 0);
+            let mut read: DWORD = 0;
+            if WinHttpReadData(
+                request,
+                body[start..].as_mut_ptr() as *mut _,
+                available,
+                &mut read,
+            ) == 0 {
+                WinHttpCloseHandle(request);
+                WinHttpCloseHandle(connection);
+                WinHttpCloseHandle(session);
+                return None;
+            }
+            body.truncate(start + read as usize);
+        }
+
+        WinHttpCloseHandle(request);
+        WinHttpCloseHandle(connection);
+        WinHttpCloseHandle(session);
+        Some(body)
+    }
+}
+
+fn parse_version(version: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = version.trim_start_matches('v').split('.');
+    let parsed = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    if parts.next().is_some() { None } else { Some(parsed) }
+}
+
+fn update_is_newer(latest: &str) -> bool {
+    match (parse_version(latest), parse_version(CURRENT_VERSION)) {
+        (Some(latest), Some(current)) => latest > current,
+        _ => false,
+    }
+}
+
+/// Download and execute a verified newer installer, if one is published.
+/// The updater accepts only the public GitHub release API response for this
+/// repository and verifies the release's SHA-256 digest before execution.
+fn install_latest_release() {
+    let metadata = match https_get(UPDATE_API_HOST, UPDATE_API_PATH, 1_024 * 1_024) {
+        Some(data) => data,
+        None => return,
+    };
+    let release: serde_json::Value = match serde_json::from_slice(&metadata) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let tag = match release.get("tag_name").and_then(|value| value.as_str()) {
+        Some(tag) if update_is_newer(tag) => tag,
+        _ => return,
+    };
+    let asset = match release.get("assets").and_then(|value| value.as_array()).and_then(|assets| {
+        assets.iter().find(|asset| {
+            asset.get("name").and_then(|value| value.as_str()) == Some("setup.exe")
+                && asset.get("state").and_then(|value| value.as_str()) == Some("uploaded")
+        })
+    }) {
+        Some(asset) => asset,
+        None => return,
+    };
+    let url = match asset.get("browser_download_url").and_then(|value| value.as_str()) {
+        Some(url) => url,
+        None => return,
+    };
+    let expected_digest = match asset.get("digest").and_then(|value| value.as_str()) {
+        Some(digest) if digest.len() == 71 && digest.starts_with("sha256:") => digest,
+        _ => return,
+    };
+    let expected_size = match asset.get("size").and_then(|value| value.as_u64()) {
+        Some(size) if size > 0 && size <= 16 * 1_024 * 1_024 => size as usize,
+        _ => return,
+    };
+    let prefix = "https://github.com/BobanAliBrz/BrojRacunaraAliBrz/";
+    let path = match url.strip_prefix(prefix) {
+        Some(path) if path.starts_with("releases/download/") => format!("/{}", path),
+        _ => return,
+    };
+
+    let installer = match https_get(UPDATE_DOWNLOAD_HOST, &path, expected_size) {
+        Some(data) if data.len() == expected_size => data,
+        _ => return,
+    };
+    let actual_digest = format!("sha256:{:x}", Sha256::digest(&installer));
+    if actual_digest != expected_digest {
+        return;
+    }
+
+    let installer_path = std::env::temp_dir().join(format!(
+        "TaskbarIP-{}-setup.exe",
+        tag.trim_start_matches('v')
+    ));
+    if std::fs::write(&installer_path, installer).is_ok() {
+        let _ = std::process::Command::new(installer_path)
+            .arg("--silent-update")
+            .spawn();
+    }
+}
+
+fn start_automatic_updates() {
+    std::thread::spawn(|| loop {
+        install_latest_release();
+        std::thread::sleep(std::time::Duration::from_secs(24 * 60 * 60));
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_version, update_is_newer};
+
+    #[test]
+    fn parses_release_versions() {
+        assert_eq!(parse_version("v1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_version("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_version("v1.2"), None);
+        assert_eq!(parse_version("v1.2.3-beta"), None);
+    }
+
+    #[test]
+    fn accepts_only_newer_versions() {
+        assert!(update_is_newer("v1.2.1"));
+        assert!(update_is_newer("v1.3.0"));
+        assert!(!update_is_newer("v1.2.0"));
+        assert!(!update_is_newer("v1.1.9"));
+    }
+}
+
 fn select_ip_by_priority(ips: &[(String, u8)]) -> String {
     for (ip, _) in ips {
         let parts: Vec<&str> = ip.split('.').collect();
@@ -347,8 +571,7 @@ fn get_first_ipv4() -> String {
     }
 }
 
-/// Detect if running on Windows 7 or earlier
-fn is_windows_7_or_lower() -> bool {
+fn windows_version() -> Option<(DWORD, DWORD, DWORD)> {
     unsafe {
         #[repr(C)]
         #[allow(non_snake_case)]
@@ -376,13 +599,25 @@ fn is_windows_7_or_lower() -> bool {
                 let mut osvi: OSVERSIONINFOEXW = std::mem::zeroed();
                 osvi.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOEXW>() as DWORD;
                 if rtl_get_version(&mut osvi) == 0 {
-                    // Windows 7 is Major 6, Minor 1. Windows Vista is Major 6, Minor 0.
-                    return osvi.dwMajorVersion < 6 || (osvi.dwMajorVersion == 6 && osvi.dwMinorVersion <= 1);
+                    return Some((osvi.dwMajorVersion, osvi.dwMinorVersion, osvi.dwBuildNumber));
                 }
             }
         }
-        false
+        None
     }
+}
+
+/// Windows 7 is 6.1; Vista and earlier use lower version numbers.
+fn is_windows_7_or_lower() -> bool {
+    match windows_version() {
+        Some((major, minor, _)) => major < 6 || (major == 6 && minor <= 1),
+        None => false,
+    }
+}
+
+/// Windows 11 reports 10.0 with build 22000 or later.
+fn is_windows_11_or_higher() -> bool {
+    matches!(windows_version(), Some((major, _, build)) if major > 10 || (major == 10 && build >= 22_000))
 }
 
 fn find_tray_pos(window_w: i32) -> (i32, i32) {
@@ -510,6 +745,7 @@ fn main() {
 
     if !is_preview_mode() {
         set_autostart();
+        start_automatic_updates();
     }
 
     unsafe {
@@ -537,10 +773,10 @@ fn main() {
         let (x, y) = find_tray_pos(w);
         let taskbar = FindWindowW(to_wide("Shell_TrayWnd").as_ptr(), ptr::null_mut());
         
-        // On Windows 7 or earlier, setting hwndParent to taskbar causes DWM to layer the window
-        // UNDER Shell_TrayWnd. Setting parent to NULL creates an un-owned HWND_TOPMOST window
-        // that sits cleanly ABOVE the taskbar on Windows 7.
-        let parent_hwnd = if is_windows_7_or_lower() {
+        // Windows 7 can layer taskbar-owned popups under the taskbar. On Windows 11,
+        // Start menu activation can hide a taskbar-owned popup. In both cases an
+        // independent topmost tool window remains visible without joining Alt+Tab.
+        let parent_hwnd = if is_windows_7_or_lower() || is_windows_11_or_higher() {
             ptr::null_mut()
         } else {
             taskbar

@@ -1,13 +1,16 @@
 [package]
 name = "taskbar-ip"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 
 [build-dependencies]
 embed-manifest = "=1.4.0"
 
 [dependencies]
-winapi = { version = "0.3", features = ["winuser", "wingdi", "libloaderapi", "winreg", "iphlpapi", "consoleapi", "ws2def", "tlhelp32", "handleapi", "processthreadsapi", "fileapi", "errhandlingapi", "winnt", "ntdef", "synchapi", "minwinbase", "winerror", "securitybaseapi"] }
+serde = "=1.0.202"
+serde_json = "=1.0.117"
+sha2 = "=0.10.8"
+winapi = { version = "0.3", features = ["winuser", "wingdi", "libloaderapi", "winreg", "iphlpapi", "consoleapi", "ws2def", "tlhelp32", "handleapi", "processthreadsapi", "fileapi", "errhandlingapi", "winnt", "ntdef", "synchapi", "minwinbase", "winerror", "securitybaseapi", "winhttp"] }
 
 [[bin]]
 name = "taskbar-ip"

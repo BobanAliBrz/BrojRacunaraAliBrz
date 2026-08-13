@@ -5,6 +5,15 @@ commits remain the authoritative implementation history.
 
 ## Unreleased
 
+### Added
+
+- Silent automatic updates from the latest GitHub release, with SHA-256 asset
+  verification and a per-user fallback that does not require elevation.
+
+### Fixed
+
+- Keep the overlay visible when the Windows 11 Start menu is open.
+
 ### Documentation
 
 - Added this changelog and condensed the maintainer reference in

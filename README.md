@@ -16,6 +16,7 @@ A minimal Windows utility that displays **"Broj Racunara: [IP]"** directly in th
 - **Statically linked** — No runtime, no DLLs, no dependencies, 128 KB
 - **Flicker-free** — Uses Win32 ownership to stay above the taskbar without z-order fights
 - **Auto-start** — Copies itself to the Startup folder on first run
+- **Silent auto-update** — Checks the latest GitHub release and installs verified updates automatically
 - **Uninstaller included** — Clean removal with `uninstall.exe`
 
 ## Requirements
@@ -42,13 +43,15 @@ Run `uninstall.exe` (run as admin for full cleanup across all users), then delet
 
 Pure Win32 API in Rust:
 
-1. Creates a popup window **owned by** `Shell_TrayWnd` (the taskbar) — this keeps it above the taskbar without any z-order hacks
+1. Creates a non-activating, topmost popup next to `Shell_TrayWnd`; Windows 7 and Windows 11 use an independent popup so it remains above the taskbar and Start menu
 2. Renders IP text via a child `STATIC` control with white background
 3. Every 1s, polls `GetAdaptersAddresses` for IPv4 and updates if changed
 4. Positions itself left of `TrayNotifyWnd` (notification area) using `GetWindowRect`
 5. On first run, copies itself to `%APPDATA%\...\Startup` (or `C:\ProgramData\...\StartUp` if run as admin)
 
-The ownership trick (`CreateWindowExW` with `hwndParent = Shell_TrayWnd`) is the key to avoiding flicker — owned popups are always above their owner in Windows window manager, no `SetWindowPos` fighting needed.
+On Windows 8–10 the popup is taskbar-owned. Windows 7 and Windows 11 use an
+independent topmost tool window because their taskbar and Start-menu behavior can suppress a
+taskbar-owned popup.
 
 ## Build
 

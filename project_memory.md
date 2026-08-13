@@ -42,6 +42,10 @@ The same code reserves an additional 75 px to the left on Windows 7 to avoid
 the language selector. It also detects a visible `CiceroUIWndFrame` language
 bar for positioning on other supported versions.
 
+Windows 11 also uses an unowned topmost popup. Its Start menu can suppress a
+taskbar-owned popup; an independent `WS_EX_TOPMOST` tool window keeps the
+overlay visible while Start is open.
+
 ## Installation and persistence
 
 `setup.exe` is a self-extracting installer, not merely a launcher:
@@ -56,6 +60,20 @@ renamed. It writes Run and uninstall registry entries to HKLM when elevated or
 HKCU otherwise. `KEY_WOW64_64KEY` ensures a 32-bit build writes to the native
 64-bit registry view on 64-bit Windows. The uninstaller removes the installed
 files, startup registrations, and uninstall registration.
+
+## Automatic updates
+
+The installed app checks the repository's latest published GitHub release at
+startup and every 24 hours. When a newer semantic version is available, it
+downloads only the `setup.exe` asset, validates its GitHub-provided SHA-256
+digest and size, and starts it with `--silent-update`.
+
+Silent updates display no message boxes and never request elevation. They
+prefer `%LOCALAPPDATA%\\TaskbarIP`, where the current user can replace files
+without administrator rights, then restart the overlay. A standard user cannot
+silently overwrite an administrator-owned all-users installation in
+`%ProgramData%`; the per-user location is the secure fallback. Preview mode
+never runs update checks.
 
 ## Development workflow
 

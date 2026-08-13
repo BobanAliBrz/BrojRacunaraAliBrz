@@ -130,7 +130,7 @@ fn register_uninstall_entry(exe_path: &str, uninst_path: &str, admin: bool) {
                 };
 
                 set_sz("DisplayName", "TaskbarIP - Broj Racunara");
-                set_sz("DisplayVersion", "1.1.0");
+                set_sz("DisplayVersion", env!("CARGO_PKG_VERSION"));
                 set_sz("Publisher", "TaskbarIP");
                 set_sz("UninstallString", &uninstaller_str);
                 set_sz("QuietUninstallString", &uninstaller_str);
@@ -147,13 +147,17 @@ fn register_uninstall_entry(exe_path: &str, uninst_path: &str, admin: bool) {
 }
 
 fn main() {
+    let silent_update = std::env::args().any(|arg| arg == "--silent-update");
+
     // Sanity check: make sure we have real binaries, not placeholders
     if TASKBAR_X86.len() < 4096 || TASKBAR_X64.len() < 4096 {
-        message_box(
-            "This setup.exe was not built correctly.\n\nPlease use build.ps1 to build the installer.",
-            "TaskbarIP Setup Error",
-            0x10, // MB_ICONERROR
-        );
+        if !silent_update {
+            message_box(
+                "This setup.exe was not built correctly.\n\nPlease use build.ps1 to build the installer.",
+                "TaskbarIP Setup Error",
+                0x10, // MB_ICONERROR
+            );
+        }
         return;
     }
 
@@ -172,73 +176,75 @@ fn main() {
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     // Determine install directory
-    let pd = program_data_dir();
-    let install_dir = format!("{}\\TaskbarIP", pd);
-    let dir_ok = std::fs::create_dir_all(&install_dir).is_ok();
-
-    let (exe_path, uninst_path) = if dir_ok {
-        (
-            format!("{}\\taskbar-ip.exe", install_dir),
-            format!("{}\\uninstall.exe", install_dir),
-        )
+    let shared_dir = format!("{}\\TaskbarIP", program_data_dir());
+    let local_dir = match std::env::var("LOCALAPPDATA") {
+        Ok(local) => format!("{}\\TaskbarIP", local),
+        Err(_) => String::new(),
+    };
+    let install_dirs = if silent_update {
+        // Avoid an elevation prompt: prefer the user's writable install folder.
+        vec![local_dir, shared_dir]
     } else {
-        // Fallback to user-level location
-        match std::env::var("LOCALAPPDATA") {
-            Ok(local) => {
-                let user_dir = format!("{}\\TaskbarIP", local);
-                let _ = std::fs::create_dir_all(&user_dir);
-                (
-                    format!("{}\\taskbar-ip.exe", user_dir),
-                    format!("{}\\uninstall.exe", user_dir),
-                )
-            }
-            Err(_) => {
+        vec![shared_dir, local_dir]
+    };
+
+    let mut installed: Option<(String, String, bool)> = None;
+    for install_dir in install_dirs.into_iter().filter(|dir| !dir.is_empty()) {
+        if std::fs::create_dir_all(&install_dir).is_err() {
+            continue;
+        }
+        let exe_path = format!("{}\\taskbar-ip.exe", install_dir);
+        let uninst_path = format!("{}\\uninstall.exe", install_dir);
+        if std::fs::write(&exe_path, taskbar_bytes).is_ok() {
+            installed = Some((exe_path, uninst_path, install_dir == format!("{}\\TaskbarIP", program_data_dir())));
+            break;
+        }
+    }
+
+    let (exe_path, uninst_path, installed_shared) = match installed {
+        Some(paths) => paths,
+        None => {
+            if !silent_update {
                 message_box(
-                    "Failed to create install directory.\nTry running as Administrator.",
+                    "Failed to write TaskbarIP to an install directory.",
                     "TaskbarIP Setup Error",
                     0x10,
                 );
-                return;
             }
+            return;
         }
     };
 
-    // Write the binaries
-    if let Err(e) = std::fs::write(&exe_path, taskbar_bytes) {
-        message_box(
-            &format!("Failed to write taskbar-ip.exe:\n{}\n\nTry running as Administrator.", e),
-            "TaskbarIP Setup Error",
-            0x10,
-        );
-        return;
-    }
-
-    if let Err(_) = std::fs::write(&uninst_path, uninstall_bytes) {
+    if std::fs::write(&uninst_path, uninstall_bytes).is_err() {
         // Non-fatal — uninstaller is optional
     }
 
     // Register Control Panel / Apps & Features entry
-    register_uninstall_entry(&exe_path, &uninst_path, admin);
+    register_uninstall_entry(&exe_path, &uninst_path, admin && installed_shared);
 
     // Launch the installed binary (it will handle autostart registration)
     match std::process::Command::new(&exe_path).spawn() {
         Ok(_) => {
-            let arch_str = if is_64 { "64-bit" } else { "32-bit" };
-            message_box(
-                &format!(
-                    "TaskbarIP installed successfully ({}).\n\nThe IP address will now appear in your taskbar.\nIt will start automatically on login.",
-                    arch_str
-                ),
-                "TaskbarIP Setup",
-                0x40, // MB_ICONINFORMATION
-            );
+            if !silent_update {
+                let arch_str = if is_64 { "64-bit" } else { "32-bit" };
+                message_box(
+                    &format!(
+                        "TaskbarIP installed successfully ({}).\n\nThe IP address will now appear in your taskbar.\nIt will start automatically on login.",
+                        arch_str
+                    ),
+                    "TaskbarIP Setup",
+                    0x40, // MB_ICONINFORMATION
+                );
+            }
         }
         Err(e) => {
-            message_box(
-                &format!("Installed but failed to launch:\n{}", e),
-                "TaskbarIP Setup Warning",
-                0x30, // MB_ICONWARNING
-            );
+            if !silent_update {
+                message_box(
+                    &format!("Installed but failed to launch:\n{}", e),
+                    "TaskbarIP Setup Warning",
+                    0x30, // MB_ICONWARNING
+                );
+            }
         }
     }
 }
