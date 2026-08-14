@@ -24,6 +24,11 @@ use winapi::um::wingdi::*;
 
 static mut HWND_LABEL: HWND = ptr::null_mut();
 static mut LABEL_FONT: HFONT = ptr::null_mut();
+static mut LAYOUT_INITIALIZED: bool = false;
+static mut LAST_X: i32 = 0;
+static mut LAST_Y: i32 = 0;
+static mut LAST_W: i32 = 0;
+static mut LAST_TEXT: Option<String> = None;
 const PADDING_X: i32 = 6;
 const WINDOW_H: i32 = 30;
 const MUTEX_NAME: &str = "Global\\TaskbarIP_SingleInstance";
@@ -32,6 +37,9 @@ const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const UPDATE_API_HOST: &str = "api.github.com";
 const UPDATE_API_PATH: &str = "/repos/BobanAliBrz/BrojRacunaraAliBrz/releases/latest";
 const UPDATE_DOWNLOAD_HOST: &str = "github.com";
+const IP_REFRESH_TIMER_ID: usize = 1;
+const Z_ORDER_CHECK_TIMER_ID: usize = 2;
+const Z_ORDER_CHECK_INTERVAL_MS: UINT = 100;
 
 /// Preview builds must not install themselves or change the machine's startup settings.
 fn is_preview_mode() -> bool {
@@ -504,7 +512,7 @@ fn start_automatic_updates() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_version, update_is_newer};
+    use super::{parse_version, update_is_newer, CURRENT_VERSION};
 
     #[test]
     fn parses_release_versions() {
@@ -516,10 +524,11 @@ mod tests {
 
     #[test]
     fn accepts_only_newer_versions() {
-        assert!(update_is_newer("v1.2.1"));
-        assert!(update_is_newer("v1.3.0"));
-        assert!(!update_is_newer("v1.2.0"));
-        assert!(!update_is_newer("v1.1.9"));
+        let (major, minor, patch) = parse_version(CURRENT_VERSION).unwrap();
+        assert!(update_is_newer(&format!("v{}.{}.{}", major, minor, patch + 1)));
+        assert!(update_is_newer(&format!("v{}.{}.0", major, minor + 1)));
+        assert!(!update_is_newer(CURRENT_VERSION));
+        assert!(!update_is_newer(&format!("v{}.{}.{}", major, minor, patch.saturating_sub(1))));
     }
 }
 
@@ -620,6 +629,10 @@ fn is_windows_11_or_higher() -> bool {
     matches!(windows_version(), Some((major, _, build)) if major > 10 || (major == 10 && build >= 22_000))
 }
 
+fn has_multiple_keyboard_layouts() -> bool {
+    unsafe { GetKeyboardLayoutList(0, ptr::null_mut()) > 1 }
+}
+
 fn find_tray_pos(window_w: i32) -> (i32, i32) {
     unsafe {
         let mut work_area: RECT = mem::zeroed();
@@ -638,13 +651,16 @@ fn find_tray_pos(window_w: i32) -> (i32, i32) {
 
         let mut min_left = tray_rc.left;
 
-        // Check if Language Bar (CiceroUIWndFrame) is visible and docked next to the tray
+        // Check if Language Bar (CiceroUIWndFrame) is visible and docked next to the tray.
+        // Its actual position, not a fixed reserve, determines the overlay's left edge.
         let lang_bar = FindWindowW(to_wide("CiceroUIWndFrame").as_ptr(), ptr::null_mut());
+        let mut lang_bar_docked = false;
         if !lang_bar.is_null() && IsWindowVisible(lang_bar) != 0 {
             let mut lang_rc: RECT = mem::zeroed();
             if GetWindowRect(lang_bar, &mut lang_rc) != 0 {
                 // Check if language bar is on the taskbar area vertically
                 if lang_rc.top >= tray_rc.top - 10 && lang_rc.bottom <= tray_rc.bottom + 10 {
+                    lang_bar_docked = true;
                     if lang_rc.left < min_left && lang_rc.left > 0 {
                         min_left = lang_rc.left;
                     }
@@ -652,11 +668,14 @@ fn find_tray_pos(window_w: i32) -> (i32, i32) {
             }
         }
 
-        // On Windows 7 or lower, add an extra 75px margin to the left
-        // to avoid covering the Windows 7 language selector ("EN", "SR", etc.) or tray edge
-        if is_windows_7_or_lower() {
-            min_left -= 75;
-        } else if !lang_bar.is_null() && IsWindowVisible(lang_bar) != 0 {
+        // Keep a small visual gap. Some Windows 7 configurations render the
+        // language selector inside the taskbar rather than as CiceroUIWndFrame;
+        // reserve only its compact width when more than one layout is available.
+        if is_windows_7_or_lower() && !lang_bar_docked && has_multiple_keyboard_layouts() {
+            min_left -= 30;
+        } else if is_windows_7_or_lower() {
+            min_left -= 12;
+        } else if lang_bar_docked {
             min_left -= 12;
         }
 
@@ -685,6 +704,30 @@ fn measure_text(text: &str) -> i32 {
     }
 }
 
+fn taskbar_is_above_overlay(overlay: HWND) -> bool {
+    unsafe {
+        let taskbar = FindWindowW(to_wide("Shell_TrayWnd").as_ptr(), ptr::null_mut());
+        if taskbar.is_null() {
+            return false;
+        }
+
+        // Walk the desktop z-order from front to back. If the taskbar appears
+        // before our popup, Explorer has covered the overlay and it needs one
+        // topmost restore. Start-menu windows do not trigger this path.
+        let mut window = GetTopWindow(ptr::null_mut());
+        for _ in 0..1024 {
+            if window.is_null() || window == overlay {
+                return false;
+            }
+            if window == taskbar {
+                return true;
+            }
+            window = GetWindow(window, GW_HWNDNEXT);
+        }
+        false
+    }
+}
+
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_CREATE => {
@@ -696,7 +739,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM
             if !LABEL_FONT.is_null() {
                 SendMessageW(label, WM_SETFONT, LABEL_FONT as WPARAM, 1);
             }
-            SetTimer(hwnd, 1, 1000, None);
+            SetTimer(hwnd, IP_REFRESH_TIMER_ID, 1000, None);
+            SetTimer(hwnd, Z_ORDER_CHECK_TIMER_ID, Z_ORDER_CHECK_INTERVAL_MS, None);
             0
         }
         WM_CTLCOLORSTATIC => {
@@ -706,17 +750,58 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM
             GetStockObject(WHITE_BRUSH as i32) as LRESULT
         }
         WM_TIMER => {
+            if wp == Z_ORDER_CHECK_TIMER_ID {
+                if taskbar_is_above_overlay(hwnd) {
+                    SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+                    );
+                }
+                return 0;
+            }
+            if wp != IP_REFRESH_TIMER_ID {
+                return 0;
+            }
             let ip = get_first_ipv4();
             let text = format!("Broj Racunara: {}", ip);
             let tw = measure_text(&text);
             let w = tw + PADDING_X * 2;
             let (x, y) = find_tray_pos(w);
-            SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, WINDOW_H,
-                SWP_NOACTIVATE | SWP_NOSENDCHANGING);
-            let wide = to_wide(&text);
-            SetWindowTextW(HWND_LABEL, wide.as_ptr());
-            SetWindowPos(HWND_LABEL, ptr::null_mut(), 0, 0, w, WINDOW_H, SWP_NOZORDER | SWP_NOREDRAW);
-            InvalidateRect(hwnd, ptr::null_mut(), 0);
+
+            let layout_changed = !LAYOUT_INITIALIZED || x != LAST_X || y != LAST_Y || w != LAST_W;
+            let width_changed = !LAYOUT_INITIALIZED || w != LAST_W;
+            let text_changed = LAST_TEXT.as_ref().map_or(true, |last| last != &text);
+
+            if layout_changed {
+                // Make the popup topmost once, then keep its existing z-order. Reasserting
+                // HWND_TOPMOST every second causes visible flashing when Explorer changes
+                // taskbar or Start-menu focus.
+                let flags = if LAYOUT_INITIALIZED {
+                    SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_NOZORDER
+                } else {
+                    SWP_NOACTIVATE | SWP_NOSENDCHANGING
+                };
+                let insert_after = if LAYOUT_INITIALIZED { ptr::null_mut() } else { HWND_TOPMOST };
+                if SetWindowPos(hwnd, insert_after, x, y, w, WINDOW_H, flags) != 0 {
+                    LAYOUT_INITIALIZED = true;
+                    LAST_X = x;
+                    LAST_Y = y;
+                    LAST_W = w;
+                }
+            }
+            if width_changed {
+                SetWindowPos(HWND_LABEL, ptr::null_mut(), 0, 0, w, WINDOW_H, SWP_NOZORDER | SWP_NOREDRAW);
+            }
+            if text_changed {
+                let wide = to_wide(&text);
+                SetWindowTextW(HWND_LABEL, wide.as_ptr());
+                LAST_TEXT = Some(text);
+            }
             0
         }
         WM_DESTROY => {
@@ -724,6 +809,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM
                 DeleteObject(LABEL_FONT as *mut _);
                 LABEL_FONT = ptr::null_mut();
             }
+            LAYOUT_INITIALIZED = false;
+            LAST_TEXT = None;
             PostQuitMessage(0);
             0
         }

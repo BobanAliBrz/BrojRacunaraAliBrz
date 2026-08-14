@@ -38,13 +38,19 @@ versions: it can render the popup behind `Shell_TrayWnd`. When
 use both `WS_EX_TOPMOST` and `SetWindowPos(..., HWND_TOPMOST, ...)`. Do not
 change this to taskbar ownership without testing Windows 7.
 
-The same code reserves an additional 75 px to the left on Windows 7 to avoid
-the language selector. It also detects a visible `CiceroUIWndFrame` language
-bar for positioning on other supported versions.
+The code detects a visible `CiceroUIWndFrame` language bar and positions the
+overlay directly to its left. Windows 7 otherwise uses only a 12 px tray gap;
+do not restore a fixed language-bar reserve, because it leaves a large empty
+space when that bar is hidden.
 
 Windows 11 also uses an unowned topmost popup. Its Start menu can suppress a
 taskbar-owned popup; an independent `WS_EX_TOPMOST` tool window keeps the
 overlay visible while Start is open.
+
+The overlay refreshes its text and layout only when values change. A lightweight
+z-order check restores topmost status only if `Shell_TrayWnd` is above the
+overlay, avoiding the flicker caused by repeatedly forcing z-order while the
+Start menu is active.
 
 ## Installation and persistence
 

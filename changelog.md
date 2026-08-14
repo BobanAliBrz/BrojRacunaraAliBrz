@@ -3,7 +3,7 @@
 All notable changes to TaskbarIP are recorded here. Release tags and source
 commits remain the authoritative implementation history.
 
-## Unreleased
+## [1.2.1] - 2026-08-14
 
 ### Added
 
@@ -13,6 +13,9 @@ commits remain the authoritative implementation history.
 ### Fixed
 
 - Keep the overlay visible when the Windows 11 Start menu is open.
+- Tightened the Windows 7 tray spacing while retaining language-bar avoidance.
+- Eliminated taskbar and Start-menu flicker by avoiding unnecessary overlay
+  z-order changes and text redraws.
 
 ### Documentation
 
