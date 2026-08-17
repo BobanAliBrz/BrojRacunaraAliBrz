@@ -3,6 +3,16 @@
 All notable changes to TaskbarIP are recorded here. Release tags and source
 commits remain the authoritative implementation history.
 
+## [1.2.2] - 2026-08-17
+
+### Fixed
+
+- Dynamic taskbar space detection: replaced fixed offset guessing with active
+  detection of all right-docked elements (ReBar bands, Language Bar, Help buttons,
+  OEM toolbars, custom deskbands, and docked popups) across Windows 7 through
+  Windows 11.
+- Resolved overlay collision with the Language Bar and Help button on Windows 7.
+
 ## [1.2.1] - 2026-08-14
 
 ### Added

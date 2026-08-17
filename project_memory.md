@@ -27,10 +27,13 @@ For the record of user-visible and maintenance changes, see [changelog.md](chang
   white background, centered text, and uses the same Segoe UI font for drawing
   and width measurement. Keep this pairing intact so the text remains centered
   and does not wrap.
-- The window is positioned immediately left of `TrayNotifyWnd`.
+- The window position is determined dynamically by detecting all occupied
+  taskbar elements (notification area, ReBar bands/deskbands, Language Bar, Help
+  buttons, OEM toolbars, and overlapping docked windows) and placing the overlay
+  snug in available free space to the left with a clean 6 px gap.
 - A global mutex (`Global\\TaskbarIP_SingleInstance`) prevents duplicates.
 
-### Windows 7 z-order rule
+### Windows 7 z-order and space detection rules
 
 Windows 7 treats a taskbar-owned popup differently from newer Windows
 versions: it can render the popup behind `Shell_TrayWnd`. When
@@ -38,10 +41,11 @@ versions: it can render the popup behind `Shell_TrayWnd`. When
 use both `WS_EX_TOPMOST` and `SetWindowPos(..., HWND_TOPMOST, ...)`. Do not
 change this to taskbar ownership without testing Windows 7.
 
-The code detects a visible `CiceroUIWndFrame` language bar and positions the
-overlay directly to its left. Windows 7 otherwise uses only a 12 px tray gap;
-do not restore a fixed language-bar reserve, because it leaves a large empty
-space when that bar is hidden.
+The code dynamically inspects `TrayNotifyWnd`, `ReBarWindow32` bands via
+`RB_GETBANDCOUNT`/`RB_GETRECT`/`RB_GETBANDINFO` (identifying deskbands and
+toolbars such as the Language Bar and Help buttons), taskbar child controls, and
+top-level docked windows (`CiceroUIWndFrame`), placing the overlay in the
+available free space without guessing or fixed offsets.
 
 Windows 11 also uses an unowned topmost popup. Its Start menu can suppress a
 taskbar-owned popup; an independent `WS_EX_TOPMOST` tool window keeps the
@@ -93,6 +97,15 @@ never runs update checks.
 Preview mode sets `TASKBAR_IP_PREVIEW=1`; this intentionally skips autostart
 and uninstall registration. The preview launcher stops any currently running
 TaskbarIP process first, including an installed copy.
+
+## Release deployment rule
+
+Whenever a new GitHub release is created:
+1. Build the full installer bundle using `build.ps1` to produce `dist\setup.exe`.
+2. Publish the release with `dist\setup.exe` attached to GitHub.
+3. Copy the built setup files (`dist\*`) to the network share at:
+   `\\10.0.135.252\Ono_Kad\Setup novog racunara\Taskbar IP`
+   replacing existing files.
 
 ## Key files
 

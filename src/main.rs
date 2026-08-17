@@ -5,8 +5,8 @@ use std::mem;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 use sha2::{Digest, Sha256};
-use winapi::shared::minwindef::{DWORD, HKEY, LPARAM, LRESULT, UINT, WPARAM};
-use winapi::shared::windef::{HFONT, HWND, RECT};
+use winapi::shared::minwindef::{BOOL, DWORD, HKEY, LPARAM, LRESULT, TRUE, UINT, WPARAM};
+use winapi::shared::windef::{HFONT, HWND, POINT, RECT};
 use winapi::shared::ws2def::AF_INET;
 use winapi::um::iphlpapi::GetAdaptersAddresses;
 use winapi::um::libloaderapi::{GetModuleFileNameW, GetModuleHandleW};
@@ -629,8 +629,160 @@ fn is_windows_11_or_higher() -> bool {
     matches!(windows_version(), Some((major, _, build)) if major > 10 || (major == 10 && build >= 22_000))
 }
 
-fn has_multiple_keyboard_layouts() -> bool {
-    unsafe { GetKeyboardLayoutList(0, ptr::null_mut()) > 1 }
+const RB_GETBANDCOUNT: UINT = WM_USER + 6;
+const RB_GETRECT: UINT = WM_USER + 9;
+const RB_GETBANDINFOW: UINT = WM_USER + 29;
+const RBBIM_CHILD: UINT = 0x00000010;
+const RBBIM_STYLE: UINT = 0x00000001;
+const RBBS_HIDDEN: UINT = 0x00000008;
+
+#[repr(C)]
+#[allow(non_snake_case)]
+struct REBARBANDINFO_MIN {
+    cbSize: UINT,
+    fMask: UINT,
+    fStyle: UINT,
+    clrFore: DWORD,
+    clrBack: DWORD,
+    lpText: *mut u16,
+    cch: UINT,
+    iImage: i32,
+    hwndChild: HWND,
+}
+
+struct TaskbarDetectionContext {
+    taskbar_rect: RECT,
+    is_horizontal: bool,
+    start_right: i32,
+    right_boundary: i32,
+}
+
+unsafe fn get_window_class(hwnd: HWND) -> String {
+    let mut buf = [0u16; 256];
+    let len = GetClassNameW(hwnd, buf.as_mut_ptr(), 256);
+    if len == 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buf[..len as usize])
+}
+
+unsafe extern "system" fn enum_taskbar_children(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let ctx = &mut *(lparam as *mut TaskbarDetectionContext);
+    if IsWindowVisible(hwnd) == 0 {
+        return TRUE;
+    }
+
+    let class_name = get_window_class(hwnd);
+    if class_name == "TaskbarIPC" {
+        return TRUE;
+    }
+
+    let mut rc: RECT = mem::zeroed();
+    if GetWindowRect(hwnd, &mut rc) == 0 {
+        return TRUE;
+    }
+
+    if rc.right <= rc.left || rc.bottom <= rc.top {
+        return TRUE;
+    }
+
+    let tb = &ctx.taskbar_rect;
+    if ctx.is_horizontal {
+        // Window must overlap vertically with the taskbar
+        if rc.bottom <= tb.top || rc.top >= tb.bottom {
+            return TRUE;
+        }
+
+        // Left-side controls (Start button, Search box, Task list)
+        if (class_name == "Button" && rc.left < tb.left + 80)
+            || class_name == "Start"
+            || class_name == "TrayDummySearchControl"
+        {
+            if rc.right > ctx.start_right {
+                ctx.start_right = rc.right;
+            }
+            return TRUE;
+        }
+        if class_name == "MSTaskSwWClass" || class_name == "MSTaskListWClass" {
+            return TRUE;
+        }
+
+        // Right-side controls (TrayNotifyWnd, Clock, ShowDesktop, Toolbars/Deskbands, Language Bar, TrayButtons)
+        let is_right_element = class_name == "TrayNotifyWnd"
+            || class_name == "TrayClockWClass"
+            || class_name == "TrayShowDesktopButtonWClass"
+            || class_name == "ToolbarWindow32"
+            || class_name == "CiceroUIWndFrame"
+            || class_name == "TrayButton"
+            || class_name == "InputIndicatorFlyout"
+            || class_name.contains("DeskBand")
+            || class_name.contains("Deskband")
+            || (rc.right <= tb.right + 4 && rc.left > tb.left + 80);
+
+        if is_right_element {
+            if rc.left < ctx.right_boundary && rc.left > ctx.start_right {
+                ctx.right_boundary = rc.left;
+            }
+        }
+    } else {
+        // Vertical taskbar
+        if rc.right <= tb.left || rc.left >= tb.right {
+            return TRUE;
+        }
+        let is_bottom_element = class_name == "TrayNotifyWnd"
+            || class_name == "TrayClockWClass"
+            || class_name == "ToolbarWindow32"
+            || (rc.bottom <= tb.bottom + 4 && rc.top > tb.top + 60);
+
+        if is_bottom_element {
+            if rc.top < ctx.right_boundary {
+                ctx.right_boundary = rc.top;
+            }
+        }
+    }
+
+    TRUE
+}
+
+unsafe extern "system" fn enum_top_level_overlap(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let ctx = &mut *(lparam as *mut TaskbarDetectionContext);
+    if IsWindowVisible(hwnd) == 0 {
+        return TRUE;
+    }
+
+    let class_name = get_window_class(hwnd);
+    if class_name == "TaskbarIPC" || class_name == "Shell_TrayWnd" || class_name == "Shell_SecondaryTrayWnd" {
+        return TRUE;
+    }
+
+    let mut rc: RECT = mem::zeroed();
+    if GetWindowRect(hwnd, &mut rc) == 0 {
+        return TRUE;
+    }
+
+    if rc.right <= rc.left || rc.bottom <= rc.top {
+        return TRUE;
+    }
+
+    let tb = &ctx.taskbar_rect;
+    if ctx.is_horizontal {
+        let vertically_inside = rc.top >= tb.top - 10 && rc.bottom <= tb.bottom + 10;
+        let horizontally_inside = rc.left >= tb.left && rc.right <= tb.right + 10;
+
+        if vertically_inside && horizontally_inside {
+            let is_docked = class_name == "CiceroUIWndFrame"
+                || class_name == "TF_FloatingLangBar_WndTitle"
+                || (rc.left > ctx.start_right && rc.left < ctx.right_boundary);
+
+            if is_docked {
+                if rc.left < ctx.right_boundary && rc.left > ctx.start_right {
+                    ctx.right_boundary = rc.left;
+                }
+            }
+        }
+    }
+
+    TRUE
 }
 
 fn find_tray_pos(window_w: i32) -> (i32, i32) {
@@ -639,48 +791,97 @@ fn find_tray_pos(window_w: i32) -> (i32, i32) {
         SystemParametersInfoW(0x0030, 0, &mut work_area as *mut _ as *mut winapi::ctypes::c_void, 0);
 
         let taskbar = FindWindowW(to_wide("Shell_TrayWnd").as_ptr(), ptr::null_mut());
-        if taskbar.is_null() { return (work_area.right - window_w, work_area.bottom - 30); }
-
-        let tray = FindWindowExW(taskbar, ptr::null_mut(), to_wide("TrayNotifyWnd").as_ptr(), ptr::null_mut());
-        if tray.is_null() { return (work_area.right - window_w, work_area.bottom - 30); }
-
-        let mut tray_rc: RECT = mem::zeroed();
-        if GetWindowRect(tray, &mut tray_rc) == 0 {
-            return (work_area.right - window_w, work_area.bottom - 30);
+        if taskbar.is_null() {
+            return (work_area.right - window_w, work_area.bottom - WINDOW_H);
         }
 
-        let mut min_left = tray_rc.left;
+        let mut tb_rc: RECT = mem::zeroed();
+        if GetWindowRect(taskbar, &mut tb_rc) == 0 {
+            return (work_area.right - window_w, work_area.bottom - WINDOW_H);
+        }
 
-        // Check if Language Bar (CiceroUIWndFrame) is visible and docked next to the tray.
-        // Its actual position, not a fixed reserve, determines the overlay's left edge.
-        let lang_bar = FindWindowW(to_wide("CiceroUIWndFrame").as_ptr(), ptr::null_mut());
-        let mut lang_bar_docked = false;
-        if !lang_bar.is_null() && IsWindowVisible(lang_bar) != 0 {
-            let mut lang_rc: RECT = mem::zeroed();
-            if GetWindowRect(lang_bar, &mut lang_rc) != 0 {
-                // Check if language bar is on the taskbar area vertically
-                if lang_rc.top >= tray_rc.top - 10 && lang_rc.bottom <= tray_rc.bottom + 10 {
-                    lang_bar_docked = true;
-                    if lang_rc.left < min_left && lang_rc.left > 0 {
-                        min_left = lang_rc.left;
+        let is_horizontal = (tb_rc.right - tb_rc.left) >= (tb_rc.bottom - tb_rc.top);
+
+        let mut ctx = TaskbarDetectionContext {
+            taskbar_rect: tb_rc,
+            is_horizontal,
+            start_right: tb_rc.left,
+            right_boundary: if is_horizontal { tb_rc.right } else { tb_rc.bottom },
+        };
+
+        // 1. Check TrayNotifyWnd as baseline
+        let tray = FindWindowExW(taskbar, ptr::null_mut(), to_wide("TrayNotifyWnd").as_ptr(), ptr::null_mut());
+        if !tray.is_null() && IsWindowVisible(tray) != 0 {
+            let mut tray_rc: RECT = mem::zeroed();
+            if GetWindowRect(tray, &mut tray_rc) != 0 {
+                if is_horizontal {
+                    if tray_rc.left < ctx.right_boundary && tray_rc.left > tb_rc.left {
+                        ctx.right_boundary = tray_rc.left;
+                    }
+                } else {
+                    if tray_rc.top < ctx.right_boundary && tray_rc.top > tb_rc.top {
+                        ctx.right_boundary = tray_rc.top;
                     }
                 }
             }
         }
 
-        // Keep a small visual gap. Some Windows 7 configurations render the
-        // language selector inside the taskbar rather than as CiceroUIWndFrame;
-        // reserve only its compact width when more than one layout is available.
-        if is_windows_7_or_lower() && !lang_bar_docked && has_multiple_keyboard_layouts() {
-            min_left -= 30;
-        } else if is_windows_7_or_lower() {
-            min_left -= 12;
-        } else if lang_bar_docked {
-            min_left -= 12;
+        // 2. Query ReBar bands directly (catches Language Bar, Help button, and deskbands on Win7/8/10)
+        let rebar = FindWindowExW(taskbar, ptr::null_mut(), to_wide("ReBarWindow32").as_ptr(), ptr::null_mut());
+        if !rebar.is_null() && IsWindowVisible(rebar) != 0 {
+            let band_count = SendMessageW(rebar, RB_GETBANDCOUNT, 0, 0) as i32;
+            for i in 0..band_count {
+                let mut band_rc: RECT = mem::zeroed();
+                if SendMessageW(rebar, RB_GETRECT, i as WPARAM, &mut band_rc as *mut _ as LPARAM) != 0 {
+                    MapWindowPoints(rebar, ptr::null_mut(), &mut band_rc as *mut _ as *mut POINT, 2);
+
+                    let mut info: REBARBANDINFO_MIN = mem::zeroed();
+                    info.cbSize = mem::size_of::<REBARBANDINFO_MIN>() as UINT;
+                    info.fMask = RBBIM_CHILD | RBBIM_STYLE;
+                    let _ = SendMessageW(rebar, RB_GETBANDINFOW, i as WPARAM, &mut info as *mut _ as LPARAM);
+
+                    if (info.fStyle & RBBS_HIDDEN) == 0 && band_rc.right > band_rc.left && band_rc.bottom > band_rc.top {
+                        let child_class = if !info.hwndChild.is_null() {
+                            get_window_class(info.hwndChild)
+                        } else {
+                            String::new()
+                        };
+
+                        if child_class == "MSTaskSwWClass" || child_class == "MSTaskListWClass" {
+                            // Main task buttons band on left
+                        } else {
+                            // Right-docked deskband/toolbar (Language bar, Help button, custom deskbands)
+                            if is_horizontal {
+                                if band_rc.left < ctx.right_boundary && band_rc.left > tb_rc.left + 80 {
+                                    ctx.right_boundary = band_rc.left;
+                                }
+                            } else {
+                                if band_rc.top < ctx.right_boundary && band_rc.top > tb_rc.top + 60 {
+                                    ctx.right_boundary = band_rc.top;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        let y = tray_rc.top + (tray_rc.bottom - tray_rc.top - 30) / 2;
-        (min_left - window_w, y)
+        // 3. Enumerate all taskbar child windows to catch individual controls/toolbars
+        EnumChildWindows(taskbar, Some(enum_taskbar_children), &mut ctx as *mut _ as LPARAM);
+
+        // 4. Enumerate overlapping top-level windows to catch docked/popup Cicero language bars
+        EnumWindows(Some(enum_top_level_overlap), &mut ctx as *mut _ as LPARAM);
+
+        const GAP: i32 = 6;
+        if is_horizontal {
+            let y = tb_rc.top + (tb_rc.bottom - tb_rc.top - WINDOW_H) / 2;
+            let x = ctx.right_boundary - GAP - window_w;
+            (x, y)
+        } else {
+            let x = tb_rc.left + (tb_rc.right - tb_rc.left - window_w) / 2;
+            let y = ctx.right_boundary - GAP - WINDOW_H;
+            (x, y)
+        }
     }
 }
 
@@ -775,7 +976,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM
 
             let layout_changed = !LAYOUT_INITIALIZED || x != LAST_X || y != LAST_Y || w != LAST_W;
             let width_changed = !LAYOUT_INITIALIZED || w != LAST_W;
-            let text_changed = LAST_TEXT.as_ref().map_or(true, |last| last != &text);
+            let text_changed = match &*ptr::addr_of!(LAST_TEXT) {
+                Some(last) => last != &text,
+                None => true,
+            };
 
             if layout_changed {
                 // Make the popup topmost once, then keep its existing z-order. Reasserting
