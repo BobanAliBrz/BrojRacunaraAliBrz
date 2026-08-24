@@ -3,6 +3,14 @@
 All notable changes to TaskbarIP are recorded here. Release tags and source
 commits remain the authoritative implementation history.
 
+## [1.2.3] - 2026-08-24
+
+### Fixed
+
+- On Windows 11, prevent internal Start/task-list layout windows from being
+  mistaken for tray-side toolbars after an update. The overlay remains anchored
+  immediately left of the notification area.
+
 ## [1.2.2] - 2026-08-17
 
 ### Fixed

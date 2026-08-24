@@ -707,17 +707,20 @@ unsafe extern "system" fn enum_taskbar_children(hwnd: HWND, lparam: LPARAM) -> B
             return TRUE;
         }
 
-        // Right-side controls (TrayNotifyWnd, Clock, ShowDesktop, Toolbars/Deskbands, Language Bar, TrayButtons)
+        // Right-side controls.  Keep this list deliberately specific: Windows 11's
+        // XAML taskbar exposes large internal child windows (often ToolbarWindow32
+        // or composition bridge windows) for the Start button and task list.  Those
+        // windows are not tray-adjacent, even though their bounds can cover most of
+        // the taskbar.  Treating every child to the right of Start as a deskband
+        // moves the overlay all the way back to Start.
         let is_right_element = class_name == "TrayNotifyWnd"
             || class_name == "TrayClockWClass"
             || class_name == "TrayShowDesktopButtonWClass"
-            || class_name == "ToolbarWindow32"
             || class_name == "CiceroUIWndFrame"
             || class_name == "TrayButton"
             || class_name == "InputIndicatorFlyout"
             || class_name.contains("DeskBand")
-            || class_name.contains("Deskband")
-            || (rc.right <= tb.right + 4 && rc.left > tb.left + 80);
+            || class_name.contains("Deskband");
 
         if is_right_element {
             if rc.left < ctx.right_boundary && rc.left > ctx.start_right {
@@ -731,8 +734,9 @@ unsafe extern "system" fn enum_taskbar_children(hwnd: HWND, lparam: LPARAM) -> B
         }
         let is_bottom_element = class_name == "TrayNotifyWnd"
             || class_name == "TrayClockWClass"
-            || class_name == "ToolbarWindow32"
-            || (rc.bottom <= tb.bottom + 4 && rc.top > tb.top + 60);
+            || class_name == "CiceroUIWndFrame"
+            || class_name.contains("DeskBand")
+            || class_name.contains("Deskband");
 
         if is_bottom_element {
             if rc.top < ctx.right_boundary {
@@ -770,9 +774,12 @@ unsafe extern "system" fn enum_top_level_overlap(hwnd: HWND, lparam: LPARAM) -> 
         let horizontally_inside = rc.left >= tb.left && rc.right <= tb.right + 10;
 
         if vertically_inside && horizontally_inside {
+            // Do not infer that an arbitrary top-level window is a docked
+            // toolbar.  Windows 11 can report taskbar composition windows in
+            // this rectangle; only the documented language-bar windows belong
+            // in the reserved area.
             let is_docked = class_name == "CiceroUIWndFrame"
-                || class_name == "TF_FloatingLangBar_WndTitle"
-                || (rc.left > ctx.start_right && rc.left < ctx.right_boundary);
+                || class_name == "TF_FloatingLangBar_WndTitle";
 
             if is_docked {
                 if rc.left < ctx.right_boundary && rc.left > ctx.start_right {
@@ -826,9 +833,12 @@ fn find_tray_pos(window_w: i32) -> (i32, i32) {
             }
         }
 
-        // 2. Query ReBar bands directly (catches Language Bar, Help button, and deskbands on Win7/8/10)
+        // 2. Query legacy ReBar bands directly (catches Language Bar, Help
+        // button, and deskbands on Win7/8/10).  Windows 11's taskbar is XAML
+        // based; its internal layout windows are not ReBar deskbands and must
+        // not be allowed to replace the notification-area boundary.
         let rebar = FindWindowExW(taskbar, ptr::null_mut(), to_wide("ReBarWindow32").as_ptr(), ptr::null_mut());
-        if !rebar.is_null() && IsWindowVisible(rebar) != 0 {
+        if !is_windows_11_or_higher() && !rebar.is_null() && IsWindowVisible(rebar) != 0 {
             let band_count = SendMessageW(rebar, RB_GETBANDCOUNT, 0, 0) as i32;
             for i in 0..band_count {
                 let mut band_rc: RECT = mem::zeroed();
