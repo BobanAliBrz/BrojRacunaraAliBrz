@@ -120,10 +120,13 @@ When GitHub is unreachable or its download fails verification, the updater
 falls back to the worker-only LAN share `\\10.0.135.252\taskbar ip auto update`
 (read-only) via `WNetAddConnection2W` as `auto_update_worker` (temporary, no
 drive letter; embedded read-only LAN credential, same tradeoff as the Print
-Spooler Guardian updater). The share is enumeration-hidden from other users
-(probing without worker creds yields 1223, never 67). On credential conflict
-with the user's own mapping (1219) the existing session is reused. It installs
-the newest `TaskbarIP_Setup_vX.Y.Z(.W).exe` newer than the running build;
+Spooler Guardian updater). That share is the SAME dataset as the deploy dir
+`\\10.0.135.252\Ono_Kad\Setup novog racunara\Taskbar IP`, just a second share
+name with worker-only read perms (enumeration-hidden from other users:
+probing without worker creds yields 1223, never 67). So one file drop serves
+both. On credential conflict with the user's own mapping (1219)
+the existing session is reused. It installs the newest
+`TaskbarIP_Setup_vX.Y.Z(.W).exe` newer than the running build;
 share bytes verify against the GitHub digest whenever metadata was fetched,
 otherwise version comparison plus the 16 MB cap apply (LAN trust). A `Current`
 GitHub answer never triggers a blind share install, so a compromised share
