@@ -149,14 +149,16 @@ TaskbarIP process first, including an installed copy.
 
 Whenever a new GitHub release is created:
 1. Build the full installer bundle using `build.ps1` to produce `dist\setup.exe`.
-2. Publish the release with `dist\setup.exe` attached to GitHub.
-3. Copy the built setup files (`dist\*`) to the network share at:
+2. Publish the release with `dist\setup.exe` attached to GitHub (the updater
+   matches this asset name; keep it).
+3. Copy `dist\setup.exe` to the network share at:
    `\\10.0.135.252\Ono_Kad\Setup novog racunara\Taskbar IP`
-   replacing existing files.
-4. Copy `dist\setup.exe` to the worker share
-   `\\10.0.135.252\taskbar ip auto update` as
-   `TaskbarIP_Setup_v<version>.exe` (PSG-style versioned name) so the SMB
-   updater can version-compare it.
+   (same dataset as the worker-only `\\10.0.135.252\taskbar ip auto update`
+   share) as `TaskbarIP_Setup_v<version>.exe` (PSG-style versioned name) so
+   the SMB updater can version-compare it, replacing the previous versioned
+   file. No other files are needed there: the setup is fully self-contained
+   (all arch binaries are embedded) — run it and the install (app files,
+   autostart, uninstall entry) happens on its own.
 
 ## Key files
 
