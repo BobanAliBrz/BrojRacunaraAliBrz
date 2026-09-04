@@ -51,10 +51,32 @@ Windows 11 also uses an unowned topmost popup. Its Start menu can suppress a
 taskbar-owned popup; an independent `WS_EX_TOPMOST` tool window keeps the
 overlay visible while Start is open.
 
-The overlay refreshes its text and layout only when values change. A lightweight
-z-order check restores topmost status only if `Shell_TrayWnd` is above the
-overlay, avoiding the flicker caused by repeatedly forcing z-order while the
-Start menu is active.
+Windows 8/10 use a taskbar-owned popup without `WS_EX_TOPMOST`. It stays above
+its owner automatically, so no topmost polling runs there and taskbar/Start
+focus changes cause no z-order contention.
+
+The overlay refreshes its text and layout only when values change. Paint
+flicker is suppressed with `WS_EX_COMPOSITED`, `WS_CLIPCHILDREN`, a `NULL`
+background brush, and `WM_ERASEBKGND` returning 1. On Windows 11 a
+`SetWinEventHook` foreground/reorder hook (out-of-context, coalesced via
+`RECHECK_PENDING` so `WM_TIMER` never starves) plus a 100 ms threshold-1 poll
+restores topmost status with a single async `SetWindowPos` as soon as
+`Shell_TrayWnd` covers the overlay after a taskbar click or Start close.
+Windows 7 keeps a 500 ms 2-hit debounced poll and no hook (untested here).
+`WM_WINDOWPOSCHANGING` keeps unowned popups in the topmost band without an
+extra `SetWindowPos` round-trip, and `TaskbarCreated` re-asserts topmost after
+Explorer restarts.
+
+Measured Win11 limits (composed screenshots, `C:\Users\xanix\AppData\Local\Temp\overlay_*.ps1`
+probes): while the Start/Search panel is open its DWM layer covers classic
+topmost popups and no restore can win — the overlay returns on close, now
+within ~100 ms instead of ~1 s. `taskbar_is_above_overlay()` walks the classic
+z-order, which does not include DWM-composited shell panels, so Start-open
+coverage is undetectable there by design. Hosting the overlay as a `WS_CHILD`
+of `Shell_TrayWnd` was tried and reverted: the fullscreen
+`DesktopWindowContentBridge` XAML layer paints over foreign classic children
+even at sibling-top (hiding it makes the overlay instantly bright, and kills
+tray visuals with it).
 
 ## Installation and persistence
 
@@ -75,15 +97,37 @@ files, startup registrations, and uninstall registration.
 
 The installed app checks the repository's latest published GitHub release at
 startup and every 24 hours. When a newer semantic version is available, it
-downloads only the `setup.exe` asset, validates its GitHub-provided SHA-256
-digest and size, and starts it with `--silent-update`.
+downloads only the `setup.exe` asset from
+`/<owner>/<repo>/releases/download/<tag>/setup.exe` on `github.com` (WinHTTP
+follows the CDN redirect by default), validates its GitHub-provided SHA-256
+digest and size, and starts it with `--silent-update`. `https_get` requests
+TLS 1.2/1.3 explicitly: stock Windows 7 negotiates only TLS 1.0, which GitHub
+rejects, so Win7 updates additionally need KB3140245 (and current root certs);
+this is untestable here, no Win7 machine available.
 
 Silent updates display no message boxes and never request elevation. They
 prefer `%LOCALAPPDATA%\\TaskbarIP`, where the current user can replace files
 without administrator rights, then restart the overlay. A standard user cannot
 silently overwrite an administrator-owned all-users installation in
-`%ProgramData%`; the per-user location is the secure fallback. Preview mode
-never runs update checks.
+`%ProgramData%`; the per-user location is the secure fallback. Because HKLM
+Run entries launch before HKCU ones, a stale shared copy would otherwise win
+every login and re-download each time — so at startup (before the mutex and
+autostart) the app yields to a newer per-user copy recorded in the HKCU
+uninstall entry when its exe exists. Preview mode never runs update checks
+and never yields.
+
+When GitHub is unreachable or its download fails verification, the updater
+falls back to the worker-only LAN share `\\10.0.135.252\taskbar ip auto update`
+(read-only) via `WNetAddConnection2W` as `auto_update_worker` (temporary, no
+drive letter; embedded read-only LAN credential, same tradeoff as the Print
+Spooler Guardian updater). The share is enumeration-hidden from other users
+(probing without worker creds yields 1223, never 67). On credential conflict
+with the user's own mapping (1219) the existing session is reused. It installs
+the newest `TaskbarIP_Setup_vX.Y.Z(.W).exe` newer than the running build;
+share bytes verify against the GitHub digest whenever metadata was fetched,
+otherwise version comparison plus the 16 MB cap apply (LAN trust). A `Current`
+GitHub answer never triggers a blind share install, so a compromised share
+cannot push code while GitHub is healthy.
 
 ## Development workflow
 
@@ -106,6 +150,10 @@ Whenever a new GitHub release is created:
 3. Copy the built setup files (`dist\*`) to the network share at:
    `\\10.0.135.252\Ono_Kad\Setup novog racunara\Taskbar IP`
    replacing existing files.
+4. Copy `dist\setup.exe` to the worker share
+   `\\10.0.135.252\taskbar ip auto update` as
+   `TaskbarIP_Setup_v<version>.exe` (PSG-style versioned name) so the SMB
+   updater can version-compare it.
 
 ## Key files
 

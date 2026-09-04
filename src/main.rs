@@ -6,7 +6,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 use sha2::{Digest, Sha256};
 use winapi::shared::minwindef::{BOOL, DWORD, HKEY, LPARAM, LRESULT, TRUE, UINT, WPARAM};
-use winapi::shared::windef::{HFONT, HWND, POINT, RECT};
+use winapi::shared::windef::{HFONT, HWINEVENTHOOK, HWND, POINT, RECT};
 use winapi::shared::ws2def::AF_INET;
 use winapi::um::iphlpapi::GetAdaptersAddresses;
 use winapi::um::libloaderapi::{GetModuleFileNameW, GetModuleHandleW};
@@ -14,10 +14,55 @@ use winapi::um::synchapi::CreateMutexW;
 use winapi::um::winhttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest,
     WinHttpQueryDataAvailable, WinHttpReadData, WinHttpReceiveResponse,
-    WinHttpSendRequest, WinHttpSetTimeouts, INTERNET_DEFAULT_HTTPS_PORT,
-    WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE,
+    WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts, INTERNET_DEFAULT_HTTPS_PORT,
+    WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_OPTION_SECURE_PROTOCOLS,
 };
-use winapi::um::winnt::{KEY_SET_VALUE, KEY_WRITE, REG_DWORD, REG_SZ};
+// Secure-protocol flag values (WinHTTP SDK; not defined by winapi 0.3).
+const WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2: DWORD = 0x0000_0800;
+const WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3: DWORD = 0x0000_2000;
+
+// ---- SMB (LAN) update fallback -------------------------------------------
+// Flow: GitHub first; when unreachable (proxy down, Win7 TLS, offline) or its
+// download fails verification, try the LAN update share with a dedicated
+// low-privilege worker account. Same convention as Print Spooler Guardian:
+// PSG-style versioned setup files in the per-program dir, newest-newer wins.
+// NOTE: worker password is embedded (read-only LAN account, same tradeoff as
+// the other updater here); rotating it means rebuilding.
+const SMB_UPDATE_USER: &str = "auto_update_worker";
+const SMB_UPDATE_PASSWORD: &str = "autoupdate12716";
+// Dedicated worker-visible share (read-only). Probing it without worker
+// creds yields 1223 (credential prompt, i.e. it exists but denies us),
+// never 67 — confirmed present, contents visible to the worker only.
+const SMB_UPDATE_DIR: &str = "\\\\10.0.135.252\\taskbar ip auto update";
+const SMB_MAX_BYTES: usize = 16 * 1_024 * 1_024;
+
+const RESOURCETYPE_DISK: DWORD = 0x0000_0001;
+const CONNECT_TEMPORARY: DWORD = 0x0000_0004;
+
+#[repr(C)]
+#[allow(non_snake_case)]
+struct NETRESOURCEW {
+    dwScope: DWORD,
+    dwType: DWORD,
+    dwDisplayType: DWORD,
+    dwUsage: DWORD,
+    lpLocalName: *mut u16,
+    lpRemoteName: *mut u16,
+    lpComment: *mut u16,
+    lpProvider: *mut u16,
+}
+
+#[link(name = "mpr")]
+extern "system" {
+    fn WNetAddConnection2W(
+        lpNetResource: *const NETRESOURCEW,
+        lpPassword: *const u16,
+        lpUserName: *const u16,
+        dwFlags: DWORD,
+    ) -> DWORD;
+    fn WNetCancelConnection2W(lpName: *const u16, dwFlags: DWORD, fForce: BOOL) -> DWORD;
+}
+use winapi::um::winnt::{KEY_QUERY_VALUE, KEY_SET_VALUE, KEY_WRITE, REG_DWORD, REG_SZ};
 use winapi::um::winreg::*;
 use winapi::um::winuser::*;
 use winapi::um::wingdi::*;
@@ -29,6 +74,16 @@ static mut LAST_X: i32 = 0;
 static mut LAST_Y: i32 = 0;
 static mut LAST_W: i32 = 0;
 static mut LAST_TEXT: Option<String> = None;
+static mut TASKBAR_CREATED_MSG: UINT = 0;
+static mut Z_ORDER_MISSES: u32 = 0;
+static mut OVERLAY_HWND: HWND = ptr::null_mut();
+static mut FOREGROUND_HOOK: HWINEVENTHOOK = ptr::null_mut();
+static mut REORDER_HOOK: HWINEVENTHOOK = ptr::null_mut();
+// Coalescing flag: reorder events fire in bursts (Start animation, tooltips,
+// IME). Without this the hook would flood our queue and starve WM_TIMER,
+// which is only delivered when the queue is empty.
+static RECHECK_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 const PADDING_X: i32 = 6;
 const WINDOW_H: i32 = 30;
 const MUTEX_NAME: &str = "Global\\TaskbarIP_SingleInstance";
@@ -39,7 +94,21 @@ const UPDATE_API_PATH: &str = "/repos/BobanAliBrz/BrojRacunaraAliBrz/releases/la
 const UPDATE_DOWNLOAD_HOST: &str = "github.com";
 const IP_REFRESH_TIMER_ID: usize = 1;
 const Z_ORDER_CHECK_TIMER_ID: usize = 2;
-const Z_ORDER_CHECK_INTERVAL_MS: UINT = 100;
+const Z_ORDER_CHECK_INTERVAL_MS: UINT = 500;
+const Z_ORDER_CHECK_INTERVAL_MS_WIN11: UINT = 100;
+const Z_ORDER_RESTORE_THRESHOLD: u32 = 2;
+// Win11 restores on the first hit: screenshots proved the visible blackout is
+// Shell_TrayWnd sitting above the overlay after a taskbar click or Start
+// close, so waiting only lengthens the outage. Win7 keeps its gentler
+// debounce (untested here).
+const Z_ORDER_RESTORE_THRESHOLD_WIN11: u32 = 1;
+// Posted by the WinEvent hook the moment foreground or top-level z-order
+// changes anywhere: re-check immediately instead of waiting for the poll.
+const RECHECK_Z_ORDER_MSG: UINT = WM_APP + 1;
+const EVENT_SYSTEM_FOREGROUND: DWORD = 0x0003;
+const EVENT_OBJECT_REORDER: DWORD = 0x8004;
+const WINEVENT_OUTOFCONTEXT: UINT = 0x0000;
+const WINEVENT_SKIPOWNPROCESS: UINT = 0x0002;
 
 /// Preview builds must not install themselves or change the machine's startup settings.
 fn is_preview_mode() -> bool {
@@ -257,6 +326,93 @@ fn register_uninstall_entry(exe_path: &str, admin: bool) {
     }
 }
 
+/// Hand off to a newer per-user copy, if one exists.
+///
+/// Silent updates install to `%LOCALAPPDATA%\TaskbarIP` when the shared
+/// `%ProgramData%` copy is not writable, leaving an admin-installed (HKLM)
+/// entry behind that points at the older binary. HKLM Run entries launch
+/// before HKCU ones, so without this the stale copy would win every login,
+/// re-download the release, and blink the overlay. If the HKCU uninstall
+/// entry records a newer version than this binary and the local exe exists,
+/// spawn it and exit before taking the single-instance mutex. Must run before
+/// set_autostart(), which would otherwise overwrite the newer HKCU
+/// registration with this binary's older version.
+fn yield_to_newer_local_install() {
+    let local_dir = match local_install_dir() {
+        Some(dir) => dir,
+        None => return,
+    };
+    let local_exe = format!("{}\\taskbar-ip.exe", local_dir);
+    if !file_exists_and_valid(&local_exe) {
+        return;
+    }
+    let subkey = to_wide("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\TaskbarIP");
+    let value_name = to_wide("DisplayVersion");
+    let mut registered = String::new();
+    unsafe {
+        // Mirror the write order (native 64-bit view first).
+        let views = [KEY_QUERY_VALUE | KEY_WOW64_64KEY, KEY_QUERY_VALUE];
+        for &access in &views {
+            let mut hkey: HKEY = ptr::null_mut();
+            if RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                0,
+                access,
+                &mut hkey,
+            ) != 0
+                || hkey.is_null()
+            {
+                continue;
+            }
+            let mut kind: DWORD = 0;
+            let mut bytes: DWORD = 0;
+            if RegQueryValueExW(
+                hkey,
+                value_name.as_ptr(),
+                ptr::null_mut(),
+                &mut kind,
+                ptr::null_mut(),
+                &mut bytes,
+            ) == 0
+                && kind == REG_SZ
+                && bytes >= 2
+                && bytes <= 512
+            {
+                let mut buf = vec![0u16; (bytes / 2) as usize];
+                let mut got = bytes;
+                if RegQueryValueExW(
+                    hkey,
+                    value_name.as_ptr(),
+                    ptr::null_mut(),
+                    &mut kind,
+                    buf.as_mut_ptr() as *mut u8,
+                    &mut got,
+                ) == 0
+                {
+                    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                    registered = String::from_utf16_lossy(&buf[..len]);
+                }
+            }
+            RegCloseKey(hkey);
+            if !registered.is_empty() {
+                break;
+            }
+        }
+    }
+    if registered.is_empty() {
+        return;
+    }
+    let newer = match (parse_version(&registered), parse_version(CURRENT_VERSION)) {
+        (Some(r), Some(c)) => r > c,
+        _ => false,
+    };
+    if newer {
+        let _ = std::process::Command::new(&local_exe).spawn();
+        std::process::exit(0);
+    }
+}
+
 fn set_autostart() {
     let exe = get_module_path();
     if exe.is_empty() { return; }
@@ -371,6 +527,29 @@ fn https_get(host: &str, path: &str, max_bytes: usize) -> Option<Vec<u8>> {
             return None;
         }
 
+        // GitHub requires TLS 1.2+. Stock Windows 7 negotiates only TLS 1.0
+        // by default (TLS 1.1/1.2 need KB3140245 and are opt-in), so request
+        // modern protocols explicitly. Where already default this is a no-op;
+        // where a flag is unknown the call fails and we fall back to TLS 1.2
+        // alone, then to system defaults — never worse than today.
+        let opt_len = std::mem::size_of::<DWORD>() as DWORD;
+        let mut modern = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+        if WinHttpSetOption(
+            request,
+            WINHTTP_OPTION_SECURE_PROTOCOLS,
+            &mut modern as *mut DWORD as *mut _,
+            opt_len,
+        ) == 0
+        {
+            let mut tls12 = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+            let _ = WinHttpSetOption(
+                request,
+                WINHTTP_OPTION_SECURE_PROTOCOLS,
+                &mut tls12 as *mut DWORD as *mut _,
+                opt_len,
+            );
+        }
+
         let sent = WinHttpSendRequest(request, ptr::null(), 0, ptr::null_mut(), 0, 0, 0);
         let received = sent != 0 && WinHttpReceiveResponse(request, ptr::null_mut()) != 0;
         if !received {
@@ -440,21 +619,36 @@ fn update_is_newer(latest: &str) -> bool {
     }
 }
 
-/// Download and execute a verified newer installer, if one is published.
-/// The updater accepts only the public GitHub release API response for this
-/// repository and verifies the release's SHA-256 digest before execution.
-fn install_latest_release() {
+struct ReleaseInfo {
+    tag: String,
+    path: String,
+    digest: String,
+    size: usize,
+}
+
+enum ReleaseCheck {
+    /// GitHub reachable and this binary is current: nothing to do anywhere.
+    Current,
+    /// GitHub has a newer verified release.
+    Available(ReleaseInfo),
+    /// GitHub unreachable or unusable: LAN fallback may still know better.
+    Unknown,
+}
+
+/// Read the latest published GitHub release without downloading anything.
+fn fetch_release_info() -> ReleaseCheck {
     let metadata = match https_get(UPDATE_API_HOST, UPDATE_API_PATH, 1_024 * 1_024) {
         Some(data) => data,
-        None => return,
+        None => return ReleaseCheck::Unknown,
     };
     let release: serde_json::Value = match serde_json::from_slice(&metadata) {
         Ok(value) => value,
-        Err(_) => return,
+        Err(_) => return ReleaseCheck::Unknown,
     };
     let tag = match release.get("tag_name").and_then(|value| value.as_str()) {
-        Some(tag) if update_is_newer(tag) => tag,
-        _ => return,
+        Some(tag) if update_is_newer(tag) => tag.to_string(),
+        Some(_) => return ReleaseCheck::Current,
+        None => return ReleaseCheck::Unknown,
     };
     let asset = match release.get("assets").and_then(|value| value.as_array()).and_then(|assets| {
         assets.iter().find(|asset| {
@@ -463,43 +657,232 @@ fn install_latest_release() {
         })
     }) {
         Some(asset) => asset,
-        None => return,
+        None => return ReleaseCheck::Unknown,
     };
     let url = match asset.get("browser_download_url").and_then(|value| value.as_str()) {
         Some(url) => url,
-        None => return,
+        None => return ReleaseCheck::Unknown,
     };
-    let expected_digest = match asset.get("digest").and_then(|value| value.as_str()) {
-        Some(digest) if digest.len() == 71 && digest.starts_with("sha256:") => digest,
-        _ => return,
+    let digest = match asset.get("digest").and_then(|value| value.as_str()) {
+        Some(digest) if digest.len() == 71 && digest.starts_with("sha256:") => digest.to_string(),
+        _ => return ReleaseCheck::Unknown,
     };
-    let expected_size = match asset.get("size").and_then(|value| value.as_u64()) {
+    let size = match asset.get("size").and_then(|value| value.as_u64()) {
         Some(size) if size > 0 && size <= 16 * 1_024 * 1_024 => size as usize,
-        _ => return,
+        _ => return ReleaseCheck::Unknown,
     };
-    let prefix = "https://github.com/BobanAliBrz/BrojRacunaraAliBrz/";
+    // Keep the owner/repo in the request path: the download lives at
+    // /<owner>/<repo>/releases/download/<tag>/setup.exe on github.com.
+    // (Stripping the repo prefix produced /releases/download/..., which
+    // GitHub answers with 404 "Not Found", silently disabling updates.)
+    let prefix = "https://github.com/";
     let path = match url.strip_prefix(prefix) {
-        Some(path) if path.starts_with("releases/download/") => format!("/{}", path),
-        _ => return,
+        Some(path)
+            if path.starts_with("BobanAliBrz/BrojRacunaraAliBrz/releases/download/") =>
+        {
+            format!("/{}", path)
+        }
+        _ => return ReleaseCheck::Unknown,
     };
+    ReleaseCheck::Available(ReleaseInfo { tag, path, digest, size })
+}
 
-    let installer = match https_get(UPDATE_DOWNLOAD_HOST, &path, expected_size) {
-        Some(data) if data.len() == expected_size => data,
-        _ => return,
+/// Download the GitHub asset and install it iff size and digest verify.
+fn install_verified_github_bytes(info: &ReleaseInfo) -> bool {
+    let installer = match https_get(UPDATE_DOWNLOAD_HOST, &info.path, info.size) {
+        Some(data) if data.len() == info.size => data,
+        _ => return false,
     };
-    let actual_digest = format!("sha256:{:x}", Sha256::digest(&installer));
-    if actual_digest != expected_digest {
-        return;
+    if format!("sha256:{:x}", Sha256::digest(&installer)) != info.digest {
+        return false;
     }
+    stage_and_launch(&info.tag, &installer);
+    true
+}
 
+/// Write verified installer bytes to temp and start them silently.
+fn stage_and_launch(tag: &str, bytes: &[u8]) {
     let installer_path = std::env::temp_dir().join(format!(
         "TaskbarIP-{}-setup.exe",
         tag.trim_start_matches('v')
     ));
-    if std::fs::write(&installer_path, installer).is_ok() {
+    if std::fs::write(&installer_path, bytes).is_ok() {
         let _ = std::process::Command::new(installer_path)
             .arg("--silent-update")
             .spawn();
+    }
+}
+
+/// Parse `TaskbarIP_Setup_v1.2.4(.0).exe` style names into
+/// (major, minor, patch, build). Comparison uses the full tuple with the
+/// running binary treated as `x.y.z.0`.
+fn parse_smb_filename_version(name: &str) -> Option<(u32, u32, u32, u32)> {
+    let lower = name.to_lowercase();
+    let bytes = lower.as_bytes();
+    let mut start = None;
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if (bytes[i] == b'_' || bytes[i] == b'-')
+            && bytes[i + 1] == b'v'
+            && bytes[i + 2].is_ascii_digit()
+        {
+            start = Some(i + 2);
+        }
+        i += 1;
+    }
+    let mut parts = lower[start?..]
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|p| !p.is_empty());
+    let parsed = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next().and_then(|p| p.parse().ok()).unwrap_or(0),
+    );
+    Some(parsed)
+}
+
+fn current_version_tuple() -> (u32, u32, u32, u32) {
+    match parse_version(CURRENT_VERSION) {
+        Some((major, minor, patch)) => (major, minor, patch, 0),
+        None => (0, 0, 0, 0),
+    }
+}
+
+/// Connect with the worker account. Returns `Some(we_connected)` when the dir
+/// is listable afterwards. On conflict (1219: another session already covers
+/// the server, e.g. the user's own mapping; 85: already assigned) the
+/// existing session is reused, so office PCs with mapped drives keep working.
+fn smb_connect(dir: &str) -> Option<bool> {
+    unsafe {
+        let remote_w = to_wide(dir);
+        let user_w = to_wide(SMB_UPDATE_USER);
+        let pass_w = to_wide(SMB_UPDATE_PASSWORD);
+        let resource = NETRESOURCEW {
+            dwScope: 0,
+            dwType: RESOURCETYPE_DISK,
+            dwDisplayType: 0,
+            dwUsage: 0,
+            lpLocalName: ptr::null_mut(),
+            lpRemoteName: remote_w.as_ptr() as *mut u16,
+            lpComment: ptr::null_mut(),
+            lpProvider: ptr::null_mut(),
+        };
+        let rc = WNetAddConnection2W(
+            &resource,
+            pass_w.as_ptr(),
+            user_w.as_ptr(),
+            CONNECT_TEMPORARY,
+        );
+        let explicit = rc == 0;
+        if std::fs::read_dir(dir).is_ok() {
+            Some(explicit)
+        } else {
+            if explicit {
+                WNetCancelConnection2W(remote_w.as_ptr(), 0, 0);
+            }
+            None
+        }
+    }
+}
+
+/// Newest versioned setup in the share dir that is newer than this binary.
+fn scan_smb_update_dir(dir: &str) -> Vec<(String, (u32, u32, u32, u32))> {
+    let mut found = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return found,
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name,
+            None => continue,
+        };
+        if !name.to_lowercase().ends_with(".exe") {
+            continue;
+        }
+        if let Some(version) = parse_smb_filename_version(name) {
+            if version > current_version_tuple() {
+                if let Some(path_str) = path.to_str() {
+                    found.push((path_str.to_string(), version));
+                }
+            }
+        }
+    }
+    found.sort_by(|a, b| b.1.cmp(&a.1));
+    found
+}
+
+/// SMB fallback for updates. `known` carries trusted (digest, size) from the
+/// GitHub API when metadata was reachable but the CDN download failed; then
+/// share bytes must verify exactly. Without metadata (e.g. Win7 TLS failure)
+/// version comparison plus the size cap apply (LAN trust).
+fn install_from_smb(known: Option<(&str, usize)>) -> bool {
+    let explicit = match smb_connect(SMB_UPDATE_DIR) {
+        Some(explicit) => explicit,
+        None => return false,
+    };
+    let mut installed = false;
+    if let Some((path, version)) = scan_smb_update_dir(SMB_UPDATE_DIR).into_iter().next() {
+        let tag = format!("v{}.{}.{}", version.0, version.1, version.2);
+        let read_ok = match std::fs::metadata(&path) {
+            Ok(meta) if meta.len() > 0 && meta.len() <= SMB_MAX_BYTES as u64 => true,
+            _ => false,
+        };
+        if read_ok {
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Some((digest, size)) = known {
+                    if bytes.len() == size
+                        && format!("sha256:{:x}", Sha256::digest(&bytes)) == digest
+                    {
+                        stage_and_launch(&tag, &bytes);
+                        installed = true;
+                    }
+                } else if !bytes.is_empty() && bytes.len() <= SMB_MAX_BYTES {
+                    stage_and_launch(&tag, &bytes);
+                    installed = true;
+                }
+            }
+        }
+    }
+    if explicit {
+        unsafe {
+            WNetCancelConnection2W(to_wide(SMB_UPDATE_DIR).as_ptr(), 0, 0);
+        }
+    }
+    installed
+}
+
+/// Download and execute a verified newer installer, if one is published.
+/// GitHub first; the LAN share covers proxy outages, offline sites, and
+/// legacy TLS stacks. The updater accepts only the public GitHub release API
+/// response for this repository and verifies the release's SHA-256 digest
+/// before execution.
+fn install_latest_release() {
+    match fetch_release_info() {
+        // Reachable and current: the share mirrors releases, so nothing newer
+        // can hide there. (A blind share scan here would let a compromised
+        // share push code while GitHub is healthy.)
+        ReleaseCheck::Current => {}
+        ReleaseCheck::Available(info) => {
+            if install_verified_github_bytes(&info) {
+                return;
+            }
+            install_from_smb(Some((&info.digest, info.size)));
+        }
+        // API unreachable (proxy down, Win7 TLS, no internet): version-gated
+        // LAN trust.
+        ReleaseCheck::Unknown => {
+            install_from_smb(None);
+        }
     }
 }
 
@@ -529,6 +912,17 @@ mod tests {
         assert!(update_is_newer(&format!("v{}.{}.0", major, minor + 1)));
         assert!(!update_is_newer(CURRENT_VERSION));
         assert!(!update_is_newer(&format!("v{}.{}.{}", major, minor, patch.saturating_sub(1))));
+    }
+
+    #[test]
+    fn parses_smb_setup_filenames() {
+        use super::parse_smb_filename_version as parse;
+        assert_eq!(parse("TaskbarIP_Setup_v1.2.4.exe"), Some((1, 2, 4, 0)));
+        assert_eq!(parse("TaskbarIP_Setup_v1.2.4.0.exe"), Some((1, 2, 4, 0)));
+        assert_eq!(parse("taskbarip-setup-v10.0.135.exe"), Some((10, 0, 135, 0)));
+        assert_eq!(parse("setup.exe"), None);
+        assert_eq!(parse("TaskbarIP_Setup_final.exe"), None);
+        assert_eq!(parse("notes_v1.txt"), None);
     }
 }
 
@@ -627,6 +1021,22 @@ fn is_windows_7_or_lower() -> bool {
 /// Windows 11 reports 10.0 with build 22000 or later.
 fn is_windows_11_or_higher() -> bool {
     matches!(windows_version(), Some((major, _, build)) if major > 10 || (major == 10 && build >= 22_000))
+}
+
+/// Only unowned popups compete in the topmost z-order band and need a restore
+/// timer. Windows 7 and Windows 11 use an unowned `WS_EX_TOPMOST` popup (see
+/// `main()`); Windows 8/10 use a taskbar-owned popup that always stays above
+/// its owner without `TOPMOST`, so no polling is needed there.
+///
+/// NOTE: making the Win11 overlay a `WS_CHILD` of `Shell_TrayWnd` was tried
+/// and abandoned: the fullscreen `Windows.UI.Composition.
+/// DesktopWindowContentBridge` XAML layer paints over foreign classic children
+/// (verified by hiding it: overlay instantly bright, tray visuals gone with
+/// it), even at sibling-top. A top-level topmost popup is the only working
+/// host on Win11; while Start/Search is open its DWM layer covers us and we
+/// return on close instead.
+fn should_enforce_topmost() -> bool {
+    is_windows_7_or_lower() || is_windows_11_or_higher()
 }
 
 const RB_GETBANDCOUNT: UINT = WM_USER + 6;
@@ -939,7 +1349,125 @@ fn taskbar_is_above_overlay(overlay: HWND) -> bool {
     }
 }
 
+/// Single async topmost re-assertion: no move, no size, no repaint. This is
+/// what makes the restore invisible; the visible flicker/blackout observed on
+/// Win11 was the overlay sitting behind Shell_TrayWnd, not this call.
+fn restore_topmost(hwnd: HWND) {
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+        );
+    }
+}
+
+/// Recompute the IP text and overlay geometry, moving/resizing/repainting only
+/// what changed. Called from the overlay's 1 s tick on every OS version.
+fn refresh_layout(overlay: HWND) {
+    unsafe {
+        if overlay.is_null() || IsWindow(overlay) == 0 {
+            return;
+        }
+        let ip = get_first_ipv4();
+        let text = format!("Broj Racunara: {}", ip);
+        let tw = measure_text(&text);
+        let w = tw + PADDING_X * 2;
+        let (x, y) = find_tray_pos(w);
+
+        let layout_changed = !LAYOUT_INITIALIZED || x != LAST_X || y != LAST_Y || w != LAST_W;
+        let width_changed = !LAYOUT_INITIALIZED || w != LAST_W;
+        let text_changed = match &*ptr::addr_of!(LAST_TEXT) {
+            Some(last) => last != &text,
+            None => true,
+        };
+
+        if layout_changed {
+            // Make the popup topmost once, then keep its existing z-order.
+            // Reasserting HWND_TOPMOST every second causes visible flashing
+            // when Explorer changes taskbar or Start-menu focus.
+            let flags = if LAYOUT_INITIALIZED {
+                SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_NOZORDER | SWP_ASYNCWINDOWPOS
+            } else {
+                SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS
+            };
+            // Owned Win8/10 popups stay above their owner without TOPMOST;
+            // passing HWND_TOPMOST there is ignored at best and contends
+            // with the taskbar focus at worst.
+            let insert_after = if LAYOUT_INITIALIZED {
+                ptr::null_mut()
+            } else if should_enforce_topmost() {
+                HWND_TOPMOST
+            } else {
+                HWND_TOP
+            };
+            if SetWindowPos(overlay, insert_after, x, y, w, WINDOW_H, flags) != 0 {
+                LAYOUT_INITIALIZED = true;
+                LAST_X = x;
+                LAST_Y = y;
+                LAST_W = w;
+            }
+        }
+        if width_changed {
+            SetWindowPos(HWND_LABEL, ptr::null_mut(), 0, 0, w, WINDOW_H, SWP_NOZORDER | SWP_NOREDRAW);
+        }
+        if text_changed {
+            let wide = to_wide(&text);
+            SetWindowTextW(HWND_LABEL, wide.as_ptr());
+            LAST_TEXT = Some(text);
+        }
+    }
+}
+
+/// WinEvent callback. Runs on a system thread (WINEVENT_OUTOFCONTEXT), so it
+/// only posts a message; the UI thread does the actual check/restore.
+unsafe extern "system" fn win_event_proc(
+    _hook: HWINEVENTHOOK,
+    _event: DWORD,
+    _hwnd: HWND,
+    _id_object: i32,
+    _id_child: i32,
+    _id_thread: DWORD,
+    _time: DWORD,
+) {
+    use std::sync::atomic::Ordering;
+    if OVERLAY_HWND.is_null() || RECHECK_PENDING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if PostMessageW(OVERLAY_HWND, RECHECK_Z_ORDER_MSG, 0, 0) == 0 {
+        RECHECK_PENDING.store(false, Ordering::SeqCst);
+    }
+}
+
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // Event-driven fast path for the Win11 blackout: Explorer puts
+    // Shell_TrayWnd above the overlay on taskbar clicks and Start close (and
+    // its DWM layer covers the overlay while Start is open, which no classic
+    // z-order call can defeat). Fired by the foreground/reorder hook.
+    if RECHECK_Z_ORDER_MSG != 0 && msg == RECHECK_Z_ORDER_MSG {
+        use std::sync::atomic::Ordering;
+        // Clear first so events arriving during the check queue a fresh pass.
+        RECHECK_PENDING.store(false, Ordering::SeqCst);
+        if should_enforce_topmost() && taskbar_is_above_overlay(hwnd) {
+            restore_topmost(hwnd);
+            Z_ORDER_MISSES = 0;
+        }
+        return 0;
+    }
+    // Explorer broadcasts this when Shell_TrayWnd is recreated (explorer
+    // restart). Re-assert topmost once for unowned popups; owned Win8/10
+    // popups re-anchor on the next 1s layout tick via find_tray_pos().
+    if TASKBAR_CREATED_MSG != 0 && msg == TASKBAR_CREATED_MSG {
+        Z_ORDER_MISSES = 0;
+        if should_enforce_topmost() {
+            restore_topmost(hwnd);
+        }
+        return 0;
+    }
     match msg {
         WM_CREATE => {
             let label = CreateWindowExW(0, to_wide("STATIC").as_ptr(), to_wide("...").as_ptr(),
@@ -951,7 +1479,19 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM
                 SendMessageW(label, WM_SETFONT, LABEL_FONT as WPARAM, 1);
             }
             SetTimer(hwnd, IP_REFRESH_TIMER_ID, 1000, None);
-            SetTimer(hwnd, Z_ORDER_CHECK_TIMER_ID, Z_ORDER_CHECK_INTERVAL_MS, None);
+            // Win8/10 use a taskbar-owned popup that always stays above its
+            // owner: no topmost polling needed, so no timer and no contention
+            // with taskbar/Start focus changes. Win7 polls slowly with
+            // debounce; Win11 polls fast with immediate restore (see WM_TIMER:
+            // the blackout is TB covering us, so delay only hurts).
+            if should_enforce_topmost() {
+                let interval = if is_windows_11_or_higher() {
+                    Z_ORDER_CHECK_INTERVAL_MS_WIN11
+                } else {
+                    Z_ORDER_CHECK_INTERVAL_MS
+                };
+                SetTimer(hwnd, Z_ORDER_CHECK_TIMER_ID, interval, None);
+            }
             0
         }
         WM_CTLCOLORSTATIC => {
@@ -960,71 +1500,69 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM
             SetTextColor(hdc, 0);
             GetStockObject(WHITE_BRUSH as i32) as LRESULT
         }
+        // Parent has a NULL background brush and the STATIC child paints the
+        // white face. Claiming the erase avoids the white-flash background
+        // repaint that reads as flicker during z-order swaps.
+        WM_ERASEBKGND => 1,
+        // Keep an unowned popup in the topmost band without an extra
+        // SetWindowPos round-trip. This fires for our own moves; taskbar/Start
+        // focus changes do not send us this message, so they no longer cause
+        // a synchronous flicker swap.
+        WM_WINDOWPOSCHANGING => {
+            if should_enforce_topmost() {
+                let pos = &mut *(lp as *mut WINDOWPOS);
+                if (pos.flags & SWP_NOZORDER) == 0 {
+                    pos.hwndInsertAfter = HWND_TOPMOST;
+                }
+            }
+            0
+        }
         WM_TIMER => {
             if wp == Z_ORDER_CHECK_TIMER_ID {
+                // Restore as soon as Explorer covers us: measured on Win11,
+                // every taskbar click and Start close puts Shell_TrayWnd above
+                // the overlay and the outage lasts exactly until this restore.
+                // The restore itself (async, no move/size/repaint) is
+                // invisible. Win7 keeps a 2-hit debounce (untestable here).
+                let threshold = if is_windows_11_or_higher() {
+                    Z_ORDER_RESTORE_THRESHOLD_WIN11
+                } else {
+                    Z_ORDER_RESTORE_THRESHOLD
+                };
                 if taskbar_is_above_overlay(hwnd) {
-                    SetWindowPos(
-                        hwnd,
-                        HWND_TOPMOST,
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
-                    );
+                    Z_ORDER_MISSES += 1;
+                    if Z_ORDER_MISSES >= threshold {
+                        restore_topmost(hwnd);
+                        Z_ORDER_MISSES = 0;
+                    }
+                } else {
+                    Z_ORDER_MISSES = 0;
                 }
                 return 0;
             }
             if wp != IP_REFRESH_TIMER_ID {
                 return 0;
             }
-            let ip = get_first_ipv4();
-            let text = format!("Broj Racunara: {}", ip);
-            let tw = measure_text(&text);
-            let w = tw + PADDING_X * 2;
-            let (x, y) = find_tray_pos(w);
-
-            let layout_changed = !LAYOUT_INITIALIZED || x != LAST_X || y != LAST_Y || w != LAST_W;
-            let width_changed = !LAYOUT_INITIALIZED || w != LAST_W;
-            let text_changed = match &*ptr::addr_of!(LAST_TEXT) {
-                Some(last) => last != &text,
-                None => true,
-            };
-
-            if layout_changed {
-                // Make the popup topmost once, then keep its existing z-order. Reasserting
-                // HWND_TOPMOST every second causes visible flashing when Explorer changes
-                // taskbar or Start-menu focus.
-                let flags = if LAYOUT_INITIALIZED {
-                    SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_NOZORDER
-                } else {
-                    SWP_NOACTIVATE | SWP_NOSENDCHANGING
-                };
-                let insert_after = if LAYOUT_INITIALIZED { ptr::null_mut() } else { HWND_TOPMOST };
-                if SetWindowPos(hwnd, insert_after, x, y, w, WINDOW_H, flags) != 0 {
-                    LAYOUT_INITIALIZED = true;
-                    LAST_X = x;
-                    LAST_Y = y;
-                    LAST_W = w;
-                }
-            }
-            if width_changed {
-                SetWindowPos(HWND_LABEL, ptr::null_mut(), 0, 0, w, WINDOW_H, SWP_NOZORDER | SWP_NOREDRAW);
-            }
-            if text_changed {
-                let wide = to_wide(&text);
-                SetWindowTextW(HWND_LABEL, wide.as_ptr());
-                LAST_TEXT = Some(text);
-            }
+            refresh_layout(hwnd);
             0
         }
         WM_DESTROY => {
+            if !FOREGROUND_HOOK.is_null() {
+                UnhookWinEvent(FOREGROUND_HOOK);
+                FOREGROUND_HOOK = ptr::null_mut();
+            }
+            if !REORDER_HOOK.is_null() {
+                UnhookWinEvent(REORDER_HOOK);
+                REORDER_HOOK = ptr::null_mut();
+            }
+            OVERLAY_HWND = ptr::null_mut();
             if !LABEL_FONT.is_null() {
                 DeleteObject(LABEL_FONT as *mut _);
                 LABEL_FONT = ptr::null_mut();
             }
             LAYOUT_INITIALIZED = false;
             LAST_TEXT = None;
+            Z_ORDER_MISSES = 0;
             PostQuitMessage(0);
             0
         }
@@ -1033,6 +1571,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM
 }
 
 fn main() {
+    // A newer per-user copy (from a silent update) takes over before the
+    // mutex or autostart handling, so a stale shared copy never re-downloads.
+    // Preview builds are exempt: they must never touch installed copies.
+    if !is_preview_mode() {
+        yield_to_newer_local_install();
+    }
+
     // Single-instance enforcement: if another copy is already running, exit silently
     unsafe {
         let mutex_name = to_wide(MUTEX_NAME);
@@ -1067,32 +1612,89 @@ fn main() {
             lpszClassName: name.as_ptr(),
         };
         RegisterClassW(&wc);
+        TASKBAR_CREATED_MSG =
+            RegisterWindowMessageW(to_wide("TaskbarCreated").as_ptr());
+
+        // Per-OS ownership (do not unify without testing each version):
+        // - Win7: taskbar-owned popups layer UNDER Shell_TrayWnd, so use an
+        //   unowned topmost popup with a restore poll.
+        // - Win11: independent topmost tool window (Start can suppress a
+        //   taskbar-owned popup). A WS_CHILD was tried and abandoned: the
+        //   fullscreen DesktopWindowContentBridge XAML layer paints over
+        //   foreign classic children even at sibling-top.
+        // - Win8/10: taskbar-owned popup stays above its owner without TOPMOST
+        //   and never contends with taskbar/Start focus, so no extra handling.
         let ip = get_first_ipv4();
         let text = format!("Broj Racunara: {}", ip);
         let tw = measure_text(&text);
         let w = tw + PADDING_X * 2;
         let (x, y) = find_tray_pos(w);
         let taskbar = FindWindowW(to_wide("Shell_TrayWnd").as_ptr(), ptr::null_mut());
-        
-        // Windows 7 can layer taskbar-owned popups under the taskbar. On Windows 11,
-        // Start menu activation can hide a taskbar-owned popup. In both cases an
-        // independent topmost tool window remains visible without joining Alt+Tab.
-        let parent_hwnd = if is_windows_7_or_lower() || is_windows_11_or_higher() {
+
+        // Per-OS ownership (do not unify without testing each version):
+        // - Win7: taskbar-owned popups layer UNDER Shell_TrayWnd, so use an
+        //   unowned topmost popup.
+        // - Win11: Start activation can suppress a taskbar-owned popup, so
+        //   use an independent topmost tool window (stays visible, no
+        //   Alt+Tab). A WS_CHILD was tried and abandoned: the fullscreen
+        //   DesktopWindowContentBridge XAML layer paints over foreign
+        //   classic children even at sibling-top.
+        // - Win8/10: taskbar-owned popup stays above its owner without
+        //   TOPMOST and never contends with taskbar/Start focus.
+        let enforce_topmost = should_enforce_topmost();
+        let parent_hwnd = if enforce_topmost {
             ptr::null_mut()
         } else {
             taskbar
         };
 
+        // WS_EX_COMPOSITED double-buffers the popup and WS_CLIPCHILDREN
+        // keeps parent/STATIC-label repaints from flashing over each other
+        // during a z-order swap. Owned Win8/10 popups drop WS_EX_TOPMOST.
+        let ex_style = if enforce_topmost {
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_COMPOSITED
+        } else {
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_COMPOSITED
+        };
+
         let _hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            ex_style,
             name.as_ptr(), to_wide("Broj Racunara").as_ptr(),
-            WS_POPUP | WS_VISIBLE,
+            WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN,
             x, y, w, WINDOW_H,
             parent_hwnd,
             ptr::null_mut(),
             GetModuleHandleW(ptr::null_mut()),
             ptr::null_mut(),
         );
+        // Win11 only: instant notice when foreground changes (Start open/
+        // close, taskbar click) or top-level z-order is rearranged, so the
+        // overlay is restored in milliseconds instead of at the next poll.
+        // Out-of-context hook: the callback only PostMessages (coalesced,
+        // so WM_TIMER never starves); safe across threads. Failures are
+        // non-fatal (the poll timer remains the fallback). Win7 keeps
+        // poll-only behavior; Win8/10 need nothing (owned popup).
+        if enforce_topmost && is_windows_11_or_higher() && !_hwnd.is_null() {
+            OVERLAY_HWND = _hwnd;
+            FOREGROUND_HOOK = SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_FOREGROUND,
+                ptr::null_mut(),
+                Some(win_event_proc),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            );
+            REORDER_HOOK = SetWinEventHook(
+                EVENT_OBJECT_REORDER,
+                EVENT_OBJECT_REORDER,
+                ptr::null_mut(),
+                Some(win_event_proc),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            );
+        }
         PostMessageW(_hwnd, WM_TIMER, 0, 0);
         let mut msg: MSG = mem::zeroed();
         while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) != 0 {
